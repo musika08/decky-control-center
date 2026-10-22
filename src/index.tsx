@@ -11,6 +11,7 @@ type Battery = { supported: boolean; reason: string; error: string | null; limit
 type SetResult = { ok: boolean; detail?: string };
 type BtDevice = { id: string; name: string; connected: boolean; type: 'audio' | 'input' | 'phone' | 'computer' | 'other'; le: boolean };
 type BtList = { ok: boolean; devices: BtDevice[] };
+type Scan = { active: boolean; done: boolean; devices: BtDevice[] };
 type Pairing = {
   active: boolean;
   stage: 'idle' | 'starting' | 'pairing' | 'confirm' | 'show_pin' | 'done';
@@ -30,7 +31,9 @@ const setMute = callable<[muted: boolean], boolean>('set_mute');
 const getRadios = callable<[], Radios>('get_radios');
 const setRadio = callable<[kind: 'wifi' | 'bluetooth', on: boolean], SetResult>('set_radio');
 const getBtDevices = callable<[], BtList>('get_bluetooth_devices');
-const scanBluetooth = callable<[], BtList>('scan_bluetooth');
+const startScan = callable<[], Scan>('start_scan');
+const getScan = callable<[], Scan>('get_scan');
+const stopScan = callable<[], Scan>('stop_scan');
 const unpairBluetooth = callable<[deviceId: string], { ok: boolean; status: string }>('unpair_bluetooth');
 const startPairing = callable<[deviceId: string, name: string], Pairing>('start_pairing');
 const getPairing = callable<[], Pairing>('get_pairing');
@@ -334,6 +337,7 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
   const [paired, setPaired] = useState<BtList | null>(null);
   const [found, setFound] = useState<BtDevice[] | null>(null);
   const [searching, setSearching] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [pairing, setPairing] = useState<Pairing | null>(null);
   const mounted = useRef(true);
   // True while start_pairing is in flight: polls then may still see the previous (or no) session, so ignore them.
@@ -360,7 +364,31 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
         if (mounted.current && !starting.current && p.stage !== 'idle') setPairing(p);
       })
       .catch(() => undefined);
+    // And a search that is still running.
+    getScan()
+      .then((s) => {
+        if (mounted.current && s.active) {
+          setFound(s.devices);
+          setSearching(true);
+        }
+      })
+      .catch(() => undefined);
   }, [radio.on]);
+
+  // Poll while a search runs: found devices show up as Windows reports them. Stops on unmount or when it ends.
+  useEffect(() => {
+    if (!searching) return;
+    const timer = window.setInterval(() => {
+      getScan()
+        .then((s) => {
+          if (!mounted.current) return;
+          setFound(s.devices);
+          if (!s.active) setSearching(false);
+        })
+        .catch(() => undefined);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [searching]);
 
   // Poll while a pairing runs; refresh the paired list when it ends.
   const active = pairing?.active ?? false;
@@ -393,21 +421,39 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
   }
 
   const search = async () => {
+    setFound([]);
     setSearching(true);
-    setFound(null);
     try {
-      const res = await scanBluetooth();
-      if (mounted.current) setFound(res.ok ? res.devices : []);
+      const s = await startScan();
+      if (!mounted.current) return;
+      setFound(s.devices);
+      if (!s.active) setSearching(false);
     } catch {
-      if (mounted.current) setFound([]);
-    } finally {
       if (mounted.current) setSearching(false);
+    }
+  };
+
+  // Returns once the backend has stopped the search's watchers.
+  const stopSearch = async () => {
+    setStopping(true);
+    try {
+      const s = await stopScan();
+      if (mounted.current) setFound(s.devices);
+    } catch {
+      // start_pairing stops a search too; the search also ends by itself.
+    } finally {
+      if (mounted.current) {
+        setStopping(false);
+        setSearching(false);
+      }
     }
   };
 
   const pair = async (d: BtDevice) => {
     starting.current = true;
     setPairing({ active: true, stage: 'starting', device_id: d.id, name: d.name, pin: null, kind: null, ok: null, message: null });
+    // Searching and pairing fight for the radio.
+    if (searching) await stopSearch();
     try {
       const p = await startPairing(d.id, d.name);
       if (mounted.current) setPairing(p);
@@ -441,16 +487,24 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
             </PanelSectionRow>
           )}
           {paired?.devices.map((d) => <PairedDevice key={d.id} device={d} onRemoved={refresh} />)}
-          <PanelSectionRow>
-            <ButtonItem layout="below" disabled={searching} onClick={search}>
-              {searching ? 'Searching...' : 'Search for devices'}
-            </ButtonItem>
-          </PanelSectionRow>
-          {searching && (
+          {searching ? (
+            <>
+              <PanelSectionRow>
+                <Field label="Searching..." description="Put the device in pairing mode. Devices show up here as they are found.">
+                  <Spinner style={SPINNER_STYLE} />
+                </Field>
+              </PanelSectionRow>
+              <PanelSectionRow>
+                <ButtonItem layout="below" disabled={stopping} onClick={stopSearch}>
+                  {stopping ? 'Stopping...' : 'Stop'}
+                </ButtonItem>
+              </PanelSectionRow>
+            </>
+          ) : (
             <PanelSectionRow>
-              <Field label="Looking for devices in pairing mode" description="This takes about 12 seconds.">
-                <Spinner style={SPINNER_STYLE} />
-              </Field>
+              <ButtonItem layout="below" onClick={search}>
+                Search for devices
+              </ButtonItem>
             </PanelSectionRow>
           )}
           {!searching && found?.length === 0 && (
@@ -458,14 +512,13 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
               <Field label="No new devices found" description="Put the device in pairing mode and search again." />
             </PanelSectionRow>
           )}
-          {!searching &&
-            found?.map((d) => (
-              <PanelSectionRow key={d.id}>
-                <ButtonItem label={d.name} description={d.le ? 'Bluetooth LE' : 'Bluetooth'} icon={<DeviceIcon type={d.type} />} onClick={() => pair(d)}>
-                  Pair
-                </ButtonItem>
-              </PanelSectionRow>
-            ))}
+          {found?.map((d) => (
+            <PanelSectionRow key={d.id}>
+              <ButtonItem label={d.name} description={d.le ? 'Bluetooth LE' : 'Bluetooth'} icon={<DeviceIcon type={d.type} />} onClick={() => pair(d)}>
+                Pair
+              </ButtonItem>
+            </PanelSectionRow>
+          ))}
         </>
       )}
     </PanelSection>

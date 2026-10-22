@@ -49,20 +49,35 @@ class Plugin:
         self._brightness_target: Optional[int] = None
         self._brightness_busy = False
         self._radio_lock = asyncio.Lock()
-        self._bt_scan_lock = asyncio.Lock()
+        self._scan: Optional[bluetooth.ScanSession] = None
         self._pairing: Optional[bluetooth.PairingSession] = None
-        # Decky runs every call as its own task: one lock so overlapping calls cannot orphan a helper.
+        # Decky runs every call as its own task: one lock per helper kind so overlapping calls cannot orphan a helper.
+        # Lock order: _pair_lock before _scan_lock, never the other way round.
+        self._scan_lock = asyncio.Lock()
         self._pair_lock = asyncio.Lock()
 
     async def _main(self) -> None:
         decky.logger.info("Windows Quick Settings started")
 
     async def _unload(self) -> None:
-        # Never leave a pairing helper behind.
+        # Never leave a helper behind. Both at once: Decky stops the plugin host after 5 seconds.
+        await asyncio.gather(self._unload_pairing(), self._close_scan(bluetooth.UNLOAD_GRACE))
+
+    async def _unload_pairing(self) -> None:
         async with self._pair_lock:
             session, self._pairing = self._pairing, None
             if session is not None:
                 await asyncio.to_thread(session.close, bluetooth.UNLOAD_GRACE)
+
+    async def _close_scan(self, grace: float) -> None:
+        async with self._scan_lock:
+            await self._close_scan_locked(grace)
+
+    async def _close_scan_locked(self, grace: float) -> None:
+        """Stop a running search and wait (up to `grace`) until its helper has exited. Its result stays readable.
+        The caller holds _scan_lock. Closing a finished search does nothing."""
+        if self._scan is not None:
+            await asyncio.to_thread(self._scan.close, grace)
 
     async def _guarded(self, name: str, fn: Callable[[], T], default: T) -> T:
         if not ON_WINDOWS:
@@ -123,11 +138,39 @@ class Plugin:
         devices = await self._guarded("get_bluetooth_devices", bluetooth.list_paired, None)
         return {"ok": devices is not None, "devices": devices or []}
 
-    async def scan_bluetooth(self) -> dict:
-        """Takes about bluetooth.SCAN_SECONDS. A second call while one runs waits for it and scans again."""
-        async with self._bt_scan_lock:
-            devices = await self._guarded("scan_bluetooth", bluetooth.scan, None)
-        return {"ok": devices is not None, "devices": devices or []}
+    @staticmethod
+    def _idle_scan() -> dict:
+        return {"active": False, "done": False, "devices": []}
+
+    async def start_scan(self) -> dict:
+        """Starts a search in the background; the panel then polls get_scan. A search that is still running is kept
+        and returned instead of starting a second one. No search while a pairing runs (they share the radio)."""
+        if not ON_WINDOWS:
+            return {**self._idle_scan(), "done": True}
+        async with self._scan_lock:
+            # start_pairing sets _pairing while it holds _scan_lock, so this check cannot race with it.
+            pairing = self._pairing
+            if pairing is not None and (await asyncio.to_thread(pairing.snapshot))["active"]:
+                return {**self._idle_scan(), "done": True}
+            if self._scan is not None:
+                state = await asyncio.to_thread(self._scan.snapshot)
+                if state["active"]:
+                    return state
+            session = bluetooth.ScanSession()
+            self._scan = session
+            decky.logger.info("Bluetooth search started")
+            return await asyncio.to_thread(session.start)
+
+    async def get_scan(self) -> dict:
+        session = self._scan
+        if session is None:
+            return self._idle_scan()
+        return await asyncio.to_thread(session.snapshot)
+
+    async def stop_scan(self) -> dict:
+        """The Stop button (and the panel before it pairs): returns once the helper has stopped its watchers."""
+        await self._close_scan(bluetooth.CLOSE_GRACE)
+        return await self.get_scan()
 
     async def unpair_bluetooth(self, device_id: str) -> dict:
         """Only called from the Remove confirmation in the panel."""
@@ -152,9 +195,12 @@ class Plugin:
                 session = bluetooth.PairingSession(device_id, name)
             except ValueError:
                 return {**self._idle_pairing(), "stage": "done", "ok": False, "message": "Unknown device."}
-            self._pairing = session
-            decky.logger.info(f"Pairing {device_id!r} ({name!r})")
-            return await asyncio.to_thread(session.start)
+            async with self._scan_lock:
+                # A running search and a pairing fight for the radio: stop the search first.
+                await self._close_scan_locked(bluetooth.CLOSE_GRACE)
+                self._pairing = session
+                decky.logger.info(f"Pairing {device_id!r} ({name!r})")
+                return await asyncio.to_thread(session.start)
 
     async def get_pairing(self) -> dict:
         if self._pairing is None:

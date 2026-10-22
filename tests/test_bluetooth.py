@@ -89,36 +89,6 @@ def test_list_paired_error_raises():
         bluetooth.list_paired(FakeRunner("", code=1, err="boom"))
 
 
-# Search -----------------------------------------------------------------------------------------------------------
-
-def test_scan_filters_nameless_and_paired_dedups_and_sorts():
-    out = json.dumps([
-        {"id": NEW, "name": "Zeta Headset", "paired": False, "connected": False, "category": "Audio.Headset",
-         "major": 4, "le": False},
-        {"id": "BluetoothLE#BluetoothLE48:45:e6:0b:c7:0e-aa:bb:cc:dd:ee:ff", "name": "", "paired": False,
-         "category": "", "major": None, "le": True},
-        {"id": "BluetoothLE#BluetoothLE48:45:e6:0b:c7:0e-aa:bb:cc:dd:ee:01", "name": "alpha pad", "paired": False,
-         "category": "Input.Gaming", "major": None, "le": True},
-    ])
-    r = FakeRunner(out)
-    found = bluetooth.scan(12, r)
-    assert [d["name"] for d in found] == ["alpha pad", "Zeta Headset"]
-    assert found[1]["type"] == "audio" and found[0]["le"] is True
-    script = r.scripts[0]
-    assert "GetDeviceSelectorFromPairingState($false)" in script
-    assert "AddSeconds(12)" in script
-    assert "$w.Stop()" in script
-    assert "PairAsync" not in script and "UnpairAsync" not in script
-    assert r.timeouts == [37]
-
-
-def test_scan_clamps_seconds_and_handles_empty():
-    r = FakeRunner("[]")
-    assert bluetooth.scan(999, r) == []
-    assert "AddSeconds(60)" in r.scripts[0]
-    assert bluetooth.scan(0, FakeRunner("")) == []
-
-
 # Unpair -----------------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("out,ok", [("result:Unpaired", True), ("result:AlreadyUnpaired", True),
@@ -533,6 +503,181 @@ def test_events_after_done_are_ignored():
     assert st["ok"] is False and st["pin"] is None and st["stage"] == "done"
 
 
+# Search session ---------------------------------------------------------------------------------------------------
+
+PAD = "BluetoothLE#BluetoothLE48:45:e6:0b:c7:0e-aa:bb:cc:dd:ee:01"
+BEACON = "BluetoothLE#BluetoothLE48:45:e6:0b:c7:0e-aa:bb:cc:dd:ee:ff"
+
+
+def found(proc, id, name, paired=False, le=False, category="", major=None):
+    proc.emit(event="device", id=id, name=name, paired=paired, connected=False, category=category, major=major, le=le)
+
+
+def names(state):
+    return [d["name"] for d in state["devices"]]
+
+
+def test_scan_script_watches_unpaired_and_stops_cleanly():
+    proc = FakeProc()
+    s = bluetooth.ScanSession(spawn=spawner(proc), timeout=25)
+    st = s.start()
+    assert st == {"active": True, "done": False, "devices": []}
+    script = decode_script(proc.argv)
+    assert script.count("GetDeviceSelectorFromPairingState($false)") == 2
+    assert "GetDeviceSelectorFromPairingState($true)" not in script
+    for event in ("add_Added", "add_Updated", "add_Removed", "add_EnumerationCompleted"):
+        assert event in script
+    assert "AddSeconds(25)" in script and "$w.Stop()" in script and "-eq 'stop'" in script
+    # Stop and end of input are both read from stdin; "done" is always the last line.
+    assert "$null -eq $line.Result" in script and "Emit @{ event = 'done'; reason = $reason }" in script
+    for forbidden in ("PairAsync", "UnpairAsync", "SetStateAsync", "Register-ObjectEvent"):
+        assert forbidden not in script
+    proc.end()
+
+
+def test_scan_command_line_fits_windows_limit():
+    argv = bluetooth.powershell_argv(bluetooth.SCAN_SCRIPT % {"timeout": 30})
+    assert len(subprocess.list2cmdline(argv)) < 32000
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs Windows PowerShell 5.1")
+def test_helper_scripts_parse_without_errors(tmp_path):
+    """Parses (does not run) the search and pairing helpers with PowerShell's own parser."""
+    for name, script in (("scan.ps1", bluetooth.SCAN_SCRIPT % {"timeout": 30}),
+                         ("pair.ps1", bluetooth.PAIR_SCRIPT % {"id": NEW, "timeout": 120, "pin_timeout": 60})):
+        path = tmp_path / name
+        path.write_text(script, encoding="utf-8-sig")
+        check = ("$errs = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('" + str(path) +
+                 "', [ref]$null, [ref]$errs)\n'errors:' + $errs.Count")
+        assert run_powershell(check, timeout=60).splitlines()[-1] == "errors:0"
+
+
+def test_scan_streams_devices_as_they_arrive():
+    proc = FakeProc()
+    s = bluetooth.ScanSession(spawn=spawner(proc))
+    s.start()
+    proc.emit(event="scanning")
+    found(proc, NEW, "Zeta Headset", category="Communication.Headset.Bluetooth", major=4)
+    st = wait_for(s, lambda st: len(st["devices"]) == 1)
+    assert st["active"] is True and st["done"] is False
+    assert st["devices"] == [{"id": NEW, "name": "Zeta Headset", "connected": False, "type": "audio", "le": False}]
+    found(proc, PAD, "alpha pad", le=True, category="Input.Gaming")
+    assert names(wait_for(s, lambda st: len(st["devices"]) == 2)) == ["Zeta Headset", "alpha pad"]  # arrival order
+    proc.end()
+
+
+def test_scan_dedups_skips_nameless_and_paired():
+    proc = FakeProc()
+    s = bluetooth.ScanSession(spawn=spawner(proc))
+    s.start()
+    found(proc, NEW, "Headset")
+    found(proc, BEACON, "", le=True)  # nameless: kept back
+    found(proc, SPEAKER, "Paired speaker", paired=True)  # paired: never listed
+    found(proc, "USB#VID_1234", "Not Bluetooth")  # not a Bluetooth endpoint id
+    found(proc, PAD, "pad", le=True)
+    found(proc, NEW, "Headset Pro")  # Updated with a new name: same entry, same place
+    wait_for(s, lambda st: names(st) == ["Headset Pro", "pad"])
+    found(proc, BEACON, "Beacon now named", le=True)  # Updated: a name arrived
+    assert names(wait_for(s, lambda st: len(st["devices"]) == 3)) == ["Headset Pro", "Beacon now named", "pad"]
+    proc.emit(event="removed", id=NEW)
+    proc.emit(event="removed", id="Bluetooth#unknown")
+    wait_for(s, lambda st: names(st) == ["Beacon now named", "pad"])
+    found(proc, PAD, "pad", paired=True)  # became paired (elsewhere): dropped
+    wait_for(s, lambda st: names(st) == ["Beacon now named"])
+    proc.emit(event="completed", watcher="classic")
+    proc.emit(event="done", reason="completed")
+    proc.end()
+    st = wait_for(s, lambda st: not st["active"])
+    assert st["done"] is True and names(st) == ["Beacon now named"] and s.reason == "completed"
+
+
+def test_scan_events_after_done_ignored_and_error_kept():
+    proc = FakeProc()
+    s = bluetooth.ScanSession(spawn=spawner(proc))
+    s.start()
+    proc.out.put("garbage\n")
+    proc.emit(event="error", message="Element not found.")
+    proc.emit(event="done", reason="error")
+    found(proc, NEW, "Late")
+    proc.end()
+    st = wait_for(s, lambda st: st["done"])
+    time.sleep(0.05)
+    assert s.snapshot()["devices"] == [] and s.error == "Element not found." and s.reason == "error"
+
+
+def test_scan_close_sends_stop_and_keeps_devices():
+    proc = FakeProc()
+    proc.on_command = lambda c: c == "stop" and (proc.emit(event="done", reason="stopped"), proc.end())
+    s = bluetooth.ScanSession(spawn=spawner(proc))
+    s.start()
+    found(proc, NEW, "Headset")
+    wait_for(s, lambda st: len(st["devices"]) == 1)
+    s.close(grace=6)
+    assert proc.stdin.lines == ["stop\n"] and 6 in proc.wait_timeouts and proc.killed is False
+    st = s.snapshot()
+    assert st["active"] is False and st["done"] is True and names(st) == ["Headset"] and s.reason == "stopped"
+    s.close(grace=6)  # closing again does nothing
+    assert proc.stdin.lines == ["stop\n"]
+
+
+def test_scan_close_kills_helper_that_ignores_stop():
+    proc = FakeProc(wait_hangs=True)
+    s = bluetooth.ScanSession(spawn=spawner(proc))
+    s.start()
+    s.close(grace=3)
+    assert proc.stdin.lines == ["stop\n"] and 3 in proc.wait_timeouts and proc.killed is True
+    assert s.snapshot()["done"] is True
+
+
+def test_scan_helper_ends_without_done():
+    proc = FakeProc()
+    s = bluetooth.ScanSession(spawn=spawner(proc))
+    s.start()
+    found(proc, NEW, "Headset")
+    proc.end()
+    st = wait_for(s, lambda st: st["done"])
+    assert st["active"] is False and names(st) == ["Headset"] and s.reason == "ended"
+
+
+def test_scan_python_deadline_kills_stuck_helper():
+    now = [1000.0]
+    proc = FakeProc()
+    s = bluetooth.ScanSession(spawn=spawner(proc), clock=lambda: now[0], timeout=30)
+    s.start()
+    now[0] += 30 + bluetooth.KILL_GRACE + 1
+    st = s.snapshot()
+    assert proc.killed is True and st["done"] is True and s.reason == "killed"
+
+
+def test_scan_backstop_timer_kills_without_polling():
+    proc = FakeProc()
+    s = bluetooth.ScanSession(spawn=spawner(proc), backstop=0.05)
+    s.start()
+    end = time.time() + 2
+    while not proc.killed and time.time() < end:
+        time.sleep(0.01)
+    assert proc.killed is True and s.snapshot()["done"] is True
+
+
+def test_scan_backstop_cancelled_when_helper_ends():
+    proc = FakeProc()
+    s = bluetooth.ScanSession(spawn=spawner(proc), backstop=0.2)
+    s.start()
+    proc.emit(event="done", reason="timeout")
+    proc.end()
+    wait_for(s, lambda st: st["done"])
+    time.sleep(0.3)
+    assert proc.killed is False and s.reason == "timeout"
+
+
+def test_scan_spawn_failure():
+    def spawn(argv):
+        raise OSError("no powershell")
+    s = bluetooth.ScanSession(spawn=spawn)
+    st = s.start()
+    assert st == {"active": False, "done": True, "devices": []} and "no powershell" in (s.error or "")
+
+
 # main.py wiring ---------------------------------------------------------------------------------------------------
 
 @pytest.fixture
@@ -553,19 +698,114 @@ def _boom(*a, **k):
 
 def test_main_bluetooth_errors_become_defaults(plugin, monkeypatch):
     monkeypatch.setattr(main.bluetooth, "list_paired", _boom)
-    monkeypatch.setattr(main.bluetooth, "scan", _boom)
     monkeypatch.setattr(main.bluetooth, "unpair", _boom)
     assert run(plugin.get_bluetooth_devices()) == {"ok": False, "devices": []}
-    assert run(plugin.scan_bluetooth()) == {"ok": False, "devices": []}
     assert run(plugin.unpair_bluetooth(SPEAKER)) == {"ok": False, "status": "failed"}
 
 
 def test_main_bluetooth_lists(plugin, monkeypatch):
     dev = {"id": SPEAKER, "name": "S", "connected": False, "type": "audio", "le": False}
     monkeypatch.setattr(main.bluetooth, "list_paired", lambda: [dev])
-    monkeypatch.setattr(main.bluetooth, "scan", lambda: [])
     assert run(plugin.get_bluetooth_devices()) == {"ok": True, "devices": [dev]}
-    assert run(plugin.scan_bluetooth()) == {"ok": True, "devices": []}
+
+
+@pytest.fixture
+def fake_helpers(monkeypatch):
+    """Real sessions with fake helpers; returns the lists of scan and pairing helpers spawned so far."""
+    scans, pairs = [], []
+
+    def spawn_into(procs):
+        def spawn(argv):
+            procs.append(FakeProc())
+            return procs[-1]
+        return spawn
+    real_scan, real_pair = bluetooth.ScanSession, bluetooth.PairingSession
+    monkeypatch.setattr(main.bluetooth, "ScanSession", lambda: real_scan(spawn=spawn_into(scans)))
+    monkeypatch.setattr(main.bluetooth, "PairingSession", lambda i, n: real_pair(i, n, spawn=spawn_into(pairs)))
+    return scans, pairs
+
+
+def poll_scan(plugin, pred):
+    end = time.time() + 2
+    while time.time() < end:
+        st = run(plugin.get_scan())
+        if pred(st):
+            return st
+        time.sleep(0.01)
+    raise AssertionError(f"scan never matched: {run(plugin.get_scan())}")
+
+
+def test_main_scan_flow(plugin, fake_helpers):
+    scans, _ = fake_helpers
+    assert run(plugin.get_scan()) == {"active": False, "done": False, "devices": []}
+    assert run(plugin.stop_scan()) == {"active": False, "done": False, "devices": []}
+    assert run(plugin.start_scan())["active"] is True
+    found(scans[0], NEW, "Headset")
+    assert names(poll_scan(plugin, lambda st: st["devices"])) == ["Headset"]
+    # Search again while one runs: the running one is kept, no second helper.
+    assert names(run(plugin.start_scan())) == ["Headset"] and len(scans) == 1
+    st = run(plugin.stop_scan())
+    assert scans[0].stdin.lines == ["stop\n"] and scans[0].killed is True
+    assert st["active"] is False and st["done"] is True and names(st) == ["Headset"]
+    # A finished search is replaced by a new one.
+    assert run(plugin.start_scan()) == {"active": True, "done": False, "devices": []} and len(scans) == 2
+    run(plugin._unload())
+    assert scans[1].stdin.lines == ["stop\n"] and scans[1].killed is True
+
+
+def test_main_overlapping_scan_starts_leave_one_helper(plugin, fake_helpers):
+    scans, _ = fake_helpers
+
+    async def many():
+        return await asyncio.gather(*(plugin.start_scan() for _ in range(4)))
+    run(many())
+    assert len(scans) == 1
+    run(plugin._unload())
+
+
+def test_main_pairing_stops_scan_first(plugin, fake_helpers):
+    scans, pairs = fake_helpers
+    run(plugin.start_scan())
+    found(scans[0], NEW, "Headset")
+    poll_scan(plugin, lambda st: st["devices"])
+    st = run(plugin.start_pairing(NEW, "Headset"))
+    assert st["active"] is True and len(pairs) == 1
+    assert scans[0].stdin.lines == ["stop\n"] and scans[0].killed is True
+    assert run(plugin.get_scan())["active"] is False
+    # No new search while the pairing runs.
+    assert run(plugin.start_scan())["active"] is False and len(scans) == 1
+    pairs[0].emit(event="result", status="Paired")
+    pairs[0].end()
+    end = time.time() + 2
+    while run(plugin.get_pairing())["active"] and time.time() < end:
+        time.sleep(0.01)
+    assert run(plugin.start_scan())["active"] is True and len(scans) == 2
+    run(plugin._unload())
+    assert all(p.killed for p in scans)
+
+
+def test_main_bad_pairing_id_keeps_scan(plugin, fake_helpers):
+    scans, _ = fake_helpers
+    run(plugin.start_scan())
+    assert run(plugin.start_pairing("nope", ""))["message"] == "Unknown device."
+    assert scans[0].stdin.lines == [] and run(plugin.get_scan())["active"] is True
+    run(plugin._unload())
+
+
+def test_main_unload_closes_scan_and_pairing_with_short_grace(plugin):
+    graces = []
+
+    class Session:
+        def __init__(self, kind):
+            self.kind = kind
+
+        def close(self, grace):
+            graces.append((self.kind, grace))
+    plugin._pairing = Session("pair")
+    plugin._scan = Session("scan")
+    run(plugin._unload())
+    assert sorted(graces) == [("pair", bluetooth.UNLOAD_GRACE), ("scan", bluetooth.UNLOAD_GRACE)]
+    assert plugin._pairing is None
 
 
 def test_main_pairing_flow_and_unload_cleanup(plugin, monkeypatch):
@@ -658,12 +898,14 @@ def test_main_start_pairing_bad_id(plugin):
 def test_main_bluetooth_not_windows(plugin, monkeypatch):
     monkeypatch.setattr(main, "ON_WINDOWS", False)
     monkeypatch.setattr(main.bluetooth, "PairingSession", lambda *a: pytest.fail("spawned"))
+    monkeypatch.setattr(main.bluetooth, "ScanSession", lambda *a: pytest.fail("spawned"))
     assert run(plugin.get_bluetooth_devices()) == {"ok": False, "devices": []}
     assert run(plugin.start_pairing(NEW, ""))["active"] is False
+    assert run(plugin.start_scan()) == {"active": False, "done": True, "devices": []}
 
 
 def test_main_does_no_bluetooth_io_on_load(plugin, monkeypatch):
-    for name in ("list_paired", "scan", "unpair", "PairingSession"):
+    for name in ("list_paired", "unpair", "PairingSession", "ScanSession"):
         monkeypatch.setattr(main.bluetooth, name, lambda *a, _n=name, **k: pytest.fail(f"_main called {_n}"))
     run(plugin._main())
     run(plugin._unload())

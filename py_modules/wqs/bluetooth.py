@@ -2,8 +2,10 @@
 
 - Paired list: DeviceInformation.FindAllAsync over the association endpoints (AEP) of the classic and LE Bluetooth
   protocols, with the system's own "paired" selectors (they do not start an inquiry, so this takes well under a second).
-- Search: two DeviceWatchers over the "unpaired" selectors (these do start an inquiry) for SCAN_SECONDS.
-- Pairing: DeviceInformationCustomPairing.PairAsync in a long-lived PowerShell helper that speaks JSON lines.
+- Search: two DeviceWatchers over the "unpaired" selectors (these do start an inquiry) in a long-lived PowerShell
+  helper that reports each device as a JSON line the moment Windows finds it (ScanSession).
+- Pairing: DeviceInformationCustomPairing.PairAsync in a long-lived PowerShell helper that speaks JSON lines
+  (PairingSession).
 - Remove: DeviceInformationPairing.UnpairAsync.
 
 WinRT events (DeviceWatcher.Added, PairingRequested) fire on thread-pool threads. A PowerShell script block cannot run
@@ -26,7 +28,7 @@ from typing import Any, Callable, Optional, Protocol
 
 from .runner import CREATE_NO_WINDOW, Runner, powershell_argv, run_powershell
 
-SCAN_SECONDS = 12
+SCAN_TIMEOUT = 30  # the search helper stops on its own after this many seconds
 PAIR_TIMEOUT = 120  # the helper gives up on its own after this many seconds
 PIN_TIMEOUT = 60  # how long the helper waits for Confirm/Cancel on a PIN
 KILL_GRACE = 20  # extra seconds before Python kills a helper that did not exit by itself
@@ -102,35 +104,72 @@ function New-QueueHandler([Type]$delegateType, [string]$tag) {
 }
 """
 
-SCAN_SCRIPT = PRELUDE + EXPRESSIONS + r"""$tInfo = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceWatcher, Windows.Devices.Enumeration.DeviceInformation]]
-$tUpdate = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceWatcher, Windows.Devices.Enumeration.DeviceInformationUpdate]]
-$watchers = foreach ($sel in @([Windows.Devices.Bluetooth.BluetoothDevice]::GetDeviceSelectorFromPairingState($false),
-                               [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($false))) {
-  $w = $DI::CreateWatcher($sel, $props, $AEP)
-  [void]$w.add_Added((New-QueueHandler $tInfo 'added'))
-  [void]$w.add_Updated((New-QueueHandler $tUpdate 'updated'))
-  [void]$w.add_Removed((New-QueueHandler $tUpdate 'removed'))
-  $w
-}
-$seen = @{}
-function Drain {
-  $item = $null
-  while ($queue.TryDequeue([ref]$item)) {
-    $tag = $item[0]; $a = $item[1]
-    if ($tag -eq 'added') { $seen[$a.Id] = $a }
-    elseif ($tag -eq 'updated') { if ($seen.ContainsKey($a.Id)) { $seen[$a.Id].Update($a) } }
-    else { $seen.Remove($a.Id) }
-  }
-}
+# Long-lived search helper. Two DeviceWatchers over the "unpaired" selectors (these start an inquiry). Writes one JSON
+# object per line on stdout as devices come and go: {event: device, id, name, ...} on Added and on an Updated that
+# changes the name or paired state, {event: removed, id}, {event: completed, watcher} per EnumerationCompleted, and
+# {event: done, reason} last. Stops when both watchers completed, on "stop" or end of input on stdin, or after
+# SCAN_TIMEOUT seconds.
+SCAN_SCRIPT = r"""function Emit($o) { [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject $o)); [Console]::Out.Flush() }
+$watchers = @(); $reason = 'error'
 try {
+""" + PRELUDE + EXPRESSIONS + r"""
+  $deadline = [DateTime]::UtcNow.AddSeconds(%(timeout)d)
+  $tInfo = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceWatcher, Windows.Devices.Enumeration.DeviceInformation]]
+  $tUpdate = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceWatcher, Windows.Devices.Enumeration.DeviceInformationUpdate]]
+  $tDone = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceWatcher, object]]
+  $sources = @(@('classic', [Windows.Devices.Bluetooth.BluetoothDevice]::GetDeviceSelectorFromPairingState($false)),
+               @('le', [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($false)))
+  $watchers = @(foreach ($src in $sources) {
+    $w = $DI::CreateWatcher($src[1], $props, $AEP)
+    [void]$w.add_Added((New-QueueHandler $tInfo 'added'))
+    [void]$w.add_Updated((New-QueueHandler $tUpdate 'updated'))
+    [void]$w.add_Removed((New-QueueHandler $tUpdate 'removed'))
+    [void]$w.add_EnumerationCompleted((New-QueueHandler $tDone ('completed:' + $src[0])))
+    $w
+  })
+  $seen = @{}; $sent = @{}; $completed = @{}
+  function Send-Device($d) {
+    $o = Describe $d
+    $key = '{0}|{1}' -f $o.name, $o.paired
+    if ($sent[$d.Id] -ne $key) {
+      $sent[$d.Id] = $key
+      Emit @{ event = 'device'; id = $o.id; name = $o.name; paired = $o.paired; category = $o.category; major = $o.major; le = $o.le }
+    }
+  }
+  function Drain {
+    $item = $null
+    while ($queue.TryDequeue([ref]$item)) {
+      $tag = [string]$item[0]; $a = $item[1]
+      if ($tag -eq 'added') { $seen[$a.Id] = $a; Send-Device $a }
+      elseif ($tag -eq 'updated') { if ($seen.ContainsKey($a.Id)) { $seen[$a.Id].Update($a); Send-Device $seen[$a.Id] } }
+      elseif ($tag -eq 'removed') {
+        if ($seen.ContainsKey($a.Id)) { $seen.Remove($a.Id); $sent.Remove($a.Id); Emit @{ event = 'removed'; id = $a.Id } }
+      } else {
+        $name = $tag.Substring(10); $completed[$name] = $true; Emit @{ event = 'completed'; watcher = $name }
+      }
+    }
+  }
   foreach ($w in $watchers) { $w.Start() }
-  $until = [DateTime]::UtcNow.AddSeconds(%(seconds)d)
-  while ([DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 250; Drain }
+  Emit @{ event = 'scanning' }
+  $reader = New-Object System.IO.StreamReader([Console]::OpenStandardInput())
+  $line = $reader.ReadLineAsync()
+  while ($true) {
+    Drain
+    if ($completed.Count -ge $watchers.Count) { $reason = 'completed'; break }
+    if ($line.IsCompleted) {
+      if ($null -eq $line.Result) { $reason = 'closed'; break }
+      if ($line.Result.Trim() -eq 'stop') { $reason = 'stopped'; break }
+      $line = $reader.ReadLineAsync()
+    }
+    if ([DateTime]::UtcNow -gt $deadline) { $reason = 'timeout'; break }
+    Start-Sleep -Milliseconds 100
+  }
+} catch {
+  Emit @{ event = 'error'; message = $_.Exception.Message }
 } finally {
   foreach ($w in $watchers) { try { $w.Stop() } catch { } }
-}
-Drain
-ConvertTo-Json -Compress -InputObject @($seen.Values | ForEach-Object { Describe $_ } | Where-Object { -not $_.paired })"""
+  Emit @{ event = 'done'; reason = $reason }
+}"""
 
 UNPAIR_SCRIPT = PRELUDE + r"""$d = Await ($DI::CreateFromIdAsync('%(id)s', $props, $AEP)) ([Windows.Devices.Enumeration.DeviceInformation])
 if (-not $d.Pairing.IsPaired) { 'result:NotPaired'; return }
@@ -305,14 +344,6 @@ def list_paired(runner: Optional[Runner] = None) -> list[dict]:
     return sorted(devices, key=lambda d: (not d["connected"], d["name"].lower()))
 
 
-def scan(seconds: int = SCAN_SECONDS, runner: Optional[Runner] = None) -> list[dict]:
-    """Unpaired devices found within `seconds`. Devices without a name are left out (Windows hides them too)."""
-    seconds = max(1, min(60, int(seconds)))
-    devices = _parse_list(run_powershell(SCAN_SCRIPT % {"seconds": seconds}, runner, timeout=seconds + 25))
-    named = {d["id"]: d for d in devices if d["name"]}
-    return sorted(named.values(), key=lambda d: d["name"].lower())
-
-
 def unpair(device_id: str, runner: Optional[Runner] = None) -> dict:
     """{"ok": bool, "status": DeviceUnpairingResultStatus name}. ok is also true when it was not paired."""
     out = run_powershell(UNPAIR_SCRIPT % {"id": _check_id(device_id)}, runner, timeout=30)
@@ -373,52 +404,68 @@ UNSUPPORTED_MESSAGES = {
 }
 
 
-class PairingSession:
-    """One pairing attempt, driven by the PowerShell helper. Thread-safe; all methods return snapshot()."""
+class HelperSession:
+    """A long-lived PowerShell helper that writes one JSON object per line on stdout and reads commands on stdin.
 
-    def __init__(self, device_id: str, name: str = "", spawn: Optional[Spawner] = None,
-                 clock: Callable[[], float] = time.monotonic, timeout: float = PAIR_TIMEOUT,
-                 pin_timeout: float = PIN_TIMEOUT, backstop: Optional[float] = None) -> None:
-        self.device_id = _check_id(device_id)
-        self.name = name or ""
+    Shared by pairing and search: spawning, a reader thread that passes each event to handle_event(), reaping, a
+    backstop timer that kills the helper even when nobody polls, a deadline checked on every poll, and close(grace).
+    Subclasses keep their state under self._lock and implement the hooks below."""
+
+    thread_name = "wqs-bt-helper"
+
+    def __init__(self, spawn: Optional[Spawner], clock: Callable[[], float], backstop_after: float) -> None:
         self._spawn = spawn or popen_spawner
         self._clock = clock
-        self._timeout = timeout
-        self._pin_timeout = pin_timeout
         self._lock = threading.Lock()
         self._proc: Optional[HelperProcess] = None
         self._deadline = 0.0
-        # Kills the helper even when nobody polls; tests pass a short value.
-        self._backstop_after = timeout + KILL_GRACE if backstop is None else backstop
+        self._backstop_after = backstop_after
         self._timer: Optional[threading.Timer] = None
-        # stage: starting -> pairing -> (confirm | show_pin) -> done
-        self._state: dict = {"stage": "starting", "pin": None, "kind": None, "ok": None, "message": None,
-                             "status": None}
-        self._note: Optional[str] = None  # set by "unsupported"/"rejected", kept for the final message
+
+    # hooks
+    def _finished(self) -> bool:
+        raise NotImplementedError
+
+    def handle_event(self, event: dict) -> None:
+        raise NotImplementedError
+
+    def _spawn_failed(self, error: Exception) -> None:
+        raise NotImplementedError
+
+    def _ended(self) -> None:
+        """The helper's output ended before it reported a final event."""
+        raise NotImplementedError
+
+    def _overdue(self) -> None:
+        """The helper was killed for running past its time limit."""
+        raise NotImplementedError
 
     # lifecycle
-    def start(self) -> dict:
-        script = PAIR_SCRIPT % {"id": self.device_id, "timeout": int(self._timeout),
-                                "pin_timeout": int(self._pin_timeout)}
-        self._deadline = self._clock() + self._timeout + KILL_GRACE
+    def _launch(self, script: str, limit: float) -> bool:
+        """Start the helper; Python gives up on it `limit` seconds from now (on poll) or after the backstop."""
+        self._deadline = self._clock() + limit
         try:
             self._proc = self._spawn(powershell_argv(script))
         except Exception as e:  # noqa: BLE001 - reported to the panel
-            self._finish(False, f"Could not start pairing: {e}")
-            return self.snapshot()
+            self._spawn_failed(e)
+            return False
         self._timer = threading.Timer(self._backstop_after, self._backstop)
         self._timer.daemon = True
         self._timer.start()
-        threading.Thread(target=self._read, args=(self._proc,), name="wqs-bt-pair", daemon=True).start()
-        return self.snapshot()
+        threading.Thread(target=self._read, args=(self._proc,), name=self.thread_name, daemon=True).start()
+        return True
 
     def _backstop(self) -> None:
         proc = self._proc
-        with self._lock:
-            overdue = self._state["stage"] != "done"
-        if proc is not None and overdue:
+        if proc is not None and not self._finished():
             self._kill(proc)
-            self._finish(False, "Pairing took too long and was stopped.", status="Timeout")
+            self._overdue()
+
+    def _check_deadline(self) -> None:
+        proc = self._proc
+        if proc is not None and self._clock() > self._deadline and not self._finished():
+            self._kill(proc)
+            self._overdue()
 
     def _read(self, proc: HelperProcess) -> None:
         try:
@@ -437,10 +484,8 @@ class PairingSession:
         self._reap(proc)
         if self._timer is not None:
             self._timer.cancel()
-        with self._lock:
-            unfinished = self._state["stage"] != "done"
-        if unfinished:
-            self._finish(False, self._note or "Pairing stopped unexpectedly.")
+        if not self._finished():
+            self._ended()
 
     def _reap(self, proc: HelperProcess) -> None:
         try:
@@ -457,12 +502,23 @@ class PairingSession:
         except Exception:  # noqa: BLE001
             pass
 
-    def close(self, grace: float = CLOSE_GRACE) -> None:
-        """Stop the helper (a new pairing started, or plugin unload): ask it to cancel, so the pairing operation is
-        cancelled and its handler removed, give it `grace` seconds to exit, then kill it."""
+    def _send(self, command: str) -> bool:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return False
+        try:
+            proc.stdin.write(command + "\n")
+            proc.stdin.flush()
+            return True
+        except Exception:  # noqa: BLE001 - helper already gone
+            return False
+
+    def _close(self, command: str, grace: float) -> None:
+        """Send `command` so the helper can clean up (cancel the WinRT operation, stop watchers), give it `grace`
+        seconds to exit, then kill it."""
         proc = self._proc
         if proc is not None:
-            if proc.poll() is None and self._send("cancel"):
+            if proc.poll() is None and self._send(command):
                 try:
                     proc.wait(timeout=grace)
                 except Exception:  # noqa: BLE001 - did not exit in time
@@ -470,10 +526,52 @@ class PairingSession:
             self._kill(proc)
         if self._timer is not None:
             self._timer.cancel()
+
+
+class PairingSession(HelperSession):
+    """One pairing attempt, driven by the PowerShell helper. Thread-safe; all methods return snapshot()."""
+
+    thread_name = "wqs-bt-pair"
+
+    def __init__(self, device_id: str, name: str = "", spawn: Optional[Spawner] = None,
+                 clock: Callable[[], float] = time.monotonic, timeout: float = PAIR_TIMEOUT,
+                 pin_timeout: float = PIN_TIMEOUT, backstop: Optional[float] = None) -> None:
+        self.device_id = _check_id(device_id)
+        # Kills the helper even when nobody polls; tests pass a short value.
+        super().__init__(spawn, clock, timeout + KILL_GRACE if backstop is None else backstop)
+        self.name = name or ""
+        self._timeout = timeout
+        self._pin_timeout = pin_timeout
+        # stage: starting -> pairing -> (confirm | show_pin) -> done
+        self._state: dict = {"stage": "starting", "pin": None, "kind": None, "ok": None, "message": None,
+                             "status": None}
+        self._note: Optional[str] = None  # set by "unsupported"/"rejected", kept for the final message
+
+    # lifecycle
+    def start(self) -> dict:
+        script = PAIR_SCRIPT % {"id": self.device_id, "timeout": int(self._timeout),
+                                "pin_timeout": int(self._pin_timeout)}
+        self._launch(script, self._timeout + KILL_GRACE)
+        return self.snapshot()
+
+    def _finished(self) -> bool:
         with self._lock:
-            unfinished = self._state["stage"] != "done"
-        if unfinished:
-            self._finish(False, "Pairing was cancelled.")
+            return self._state["stage"] == "done"
+
+    def _spawn_failed(self, error: Exception) -> None:
+        self._finish(False, f"Could not start pairing: {error}")
+
+    def _ended(self) -> None:
+        self._finish(False, self._note or "Pairing stopped unexpectedly.")
+
+    def _overdue(self) -> None:
+        self._finish(False, "Pairing took too long and was stopped.", status="Timeout")
+
+    def close(self, grace: float = CLOSE_GRACE) -> None:
+        """Stop the helper (a new pairing started, or plugin unload): ask it to cancel, so the pairing operation is
+        cancelled and its handler removed, give it `grace` seconds to exit, then kill it."""
+        self._close("cancel", grace)
+        self._finish(False, "Pairing was cancelled.")
 
     # events from the helper
     def handle_event(self, event: dict) -> None:
@@ -523,17 +621,6 @@ class PairingSession:
             self._state.update(stage="done", ok=ok, message=message, status=status, pin=None)
 
     # commands from the panel
-    def _send(self, command: str) -> bool:
-        proc = self._proc
-        if proc is None or proc.stdin is None:
-            return False
-        try:
-            proc.stdin.write(command + "\n")
-            proc.stdin.flush()
-            return True
-        except Exception:  # noqa: BLE001 - helper already gone
-            return False
-
     def respond(self, accept: bool) -> dict:
         with self._lock:
             waiting = self._state["stage"] == "confirm"
@@ -544,20 +631,87 @@ class PairingSession:
         return self.snapshot()
 
     def cancel(self) -> dict:
-        with self._lock:
-            active = self._state["stage"] != "done"
-        if active:
+        if not self._finished():
             self._send("cancel")
         return self.snapshot()
 
     def snapshot(self) -> dict:
-        proc = self._proc
-        if proc is not None and self._clock() > self._deadline:
-            with self._lock:
-                overdue = self._state["stage"] != "done"
-            if overdue:
-                self._kill(proc)
-                self._finish(False, "Pairing took too long and was stopped.", status="Timeout")
+        self._check_deadline()
         with self._lock:
             s = dict(self._state)
         return {"active": s["stage"] != "done", "device_id": self.device_id, "name": self.name, **s}
+
+
+# Search -----------------------------------------------------------------------------------------------------------
+
+class ScanSession(HelperSession):
+    """One search, driven by the PowerShell search helper. Devices are kept as the helper reports them, one entry per
+    id; snapshot() lists those that have a name and are not paired, in the order they were found (so the list does
+    not reorder under the controller's focus). Thread-safe; all methods return snapshot()."""
+
+    thread_name = "wqs-bt-scan"
+
+    def __init__(self, spawn: Optional[Spawner] = None, clock: Callable[[], float] = time.monotonic,
+                 timeout: float = SCAN_TIMEOUT, backstop: Optional[float] = None) -> None:
+        super().__init__(spawn, clock, timeout + KILL_GRACE if backstop is None else backstop)
+        self._timeout = timeout
+        self._devices: dict[str, dict] = {}  # id -> {id, name, connected, type, le, paired}
+        self._done = False
+        self.reason: Optional[str] = None  # completed / stopped / closed / timeout / error / killed / ...
+        self.error: Optional[str] = None
+
+    def start(self) -> dict:
+        self._launch(SCAN_SCRIPT % {"timeout": int(self._timeout)}, self._timeout + KILL_GRACE)
+        return self.snapshot()
+
+    def _finished(self) -> bool:
+        with self._lock:
+            return self._done
+
+    def _finish(self, reason: str) -> None:
+        with self._lock:
+            if not self._done:
+                self._done = True
+                self.reason = reason
+
+    def _spawn_failed(self, error: Exception) -> None:
+        self.error = f"Could not start the search: {error}"
+        self._finish("error")
+
+    def _ended(self) -> None:
+        self._finish("ended")
+
+    def _overdue(self) -> None:
+        self._finish("killed")
+
+    def close(self, grace: float = CLOSE_GRACE) -> None:
+        """Stop the search (a pairing starts, the Stop button, or plugin unload): ask the helper to stop its watchers,
+        give it `grace` seconds to exit, then kill it. The devices found so far are kept."""
+        self._close("stop", grace)
+        self._finish("stopped")
+
+    def handle_event(self, event: dict) -> None:
+        kind = event.get("event")
+        with self._lock:
+            if self._done:
+                return
+            if kind == "device":
+                d = _device(event)
+                if not DEVICE_ID.fullmatch(d["id"]):
+                    return
+                d["paired"] = bool(event.get("paired"))
+                self._devices[d["id"]] = d  # an update keeps the device's place in the order
+            elif kind == "removed":
+                self._devices.pop(str(event.get("id") or ""), None)
+            elif kind == "error":
+                self.error = str(event.get("message") or "unknown error")
+            elif kind == "done":
+                self._done = True
+                self.reason = str(event.get("reason") or "completed")
+
+    def snapshot(self) -> dict:
+        self._check_deadline()
+        with self._lock:
+            devices = [{k: v for k, v in d.items() if k != "paired"}
+                       for d in self._devices.values() if d["name"] and not d["paired"]]
+            return {"active": not self._done, "done": self._done, "devices": devices}
