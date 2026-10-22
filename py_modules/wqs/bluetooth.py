@@ -7,10 +7,14 @@
 - Remove: DeviceInformationPairing.UnpairAsync.
 
 WinRT events (DeviceWatcher.Added, PairingRequested) fire on thread-pool threads. A PowerShell script block cannot run
-there (no runspace), and Register-ObjectEvent queues the event and returns at once, too late to take the pairing
-deferral. So the handlers are built with System.Linq.Expressions and compiled in memory: they only take the deferral
-(for pairing) and put the event on a ConcurrentQueue that the script drains on its own thread. Nothing is written to
-disk and no compiler runs.
+there (no runspace), and Register-ObjectEvent queues the event and returns at once. So the handlers are built with
+System.Linq.Expressions and compiled in memory, and put the event on a ConcurrentQueue that the script drains on its own
+thread. Nothing is written to disk and no compiler runs.
+
+Pairing requests are answered inside the handler, on the event thread: an Accept() made later from the script's thread
+(through the request's deferral) is ignored by Windows, and the device then fails authentication. "Confirm only" and
+"Display PIN" are accepted at once. For "Confirm PIN match" the handler blocks its thread on a per-request
+BlockingCollection until the script passes the user's answer (or false on cancel / time limit), then accepts there.
 """
 import json
 import os
@@ -133,25 +137,55 @@ if (-not $d.Pairing.IsPaired) { 'result:NotPaired'; return }
 $r = Await ($d.Pairing.UnpairAsync()) ([Windows.Devices.Enumeration.DeviceUnpairingResult])
 'result:' + $r.Status"""
 
+# Pairing handler, compiled from an expression tree. It works for any delegate (sender, args) whose args have PairingKind,
+# Pin and Accept(), so the tests can drive it with stub types:
+#   (s, a) => {
+#     BlockingCollection<bool> box = null; bool decision = false;
+#     if (a.PairingKind == ConfirmPinMatch) box = new BlockingCollection<bool>();
+#     if (a.PairingKind == ConfirmOnly || a.PairingKind == DisplayPin) a.Accept();
+#     queue.Enqueue(new object[] { a.PairingKind, a.Pin, box });
+#     if (box != null && box.TryTake(out decision, waitMs) && decision) a.Accept();
+#   }
+# Other kinds (ProvidePin, ...) return without Accept(), which refuses them.
+PAIR_HANDLER = r"""function New-PairingHandler([Type]$delegateType, [int]$waitMs) {
+  $ps = $delegateType.GetMethod('Invoke').GetParameters()
+  $argsT = $ps[1].ParameterType
+  $s = $E::Parameter($ps[0].ParameterType, 's')
+  $a = $E::Parameter($argsT, 'a')
+  $kindT = $argsT.GetProperty('PairingKind').PropertyType
+  $kind = $E::Property($a, 'PairingKind')
+  function KindIs([string]$name) { $E::Equal($kind, $E::Constant([Enum]::Parse($kindT, $name), $kindT)) }
+  $accept = $E::Call($a, $argsT.GetMethod('Accept', [Type[]]@()))
+  $boxT = [System.Collections.Concurrent.BlockingCollection[bool]]
+  # $E::New would be read as PowerShell's constructor syntax, so call Expression.New(Type) by reflection.
+  $newBox = $E.GetMethod('New', [Type[]]@([Type])).Invoke($null, @($boxT))
+  $box = $E::Variable($boxT, 'box')
+  $decision = $E::Variable([bool], 'decision')
+  $tryTake = $boxT.GetMethod('TryTake', [Type[]]@([bool].MakeByRefType(), [int]))
+  $item = $E::NewArrayInit([object], [System.Linq.Expressions.Expression[]]@($E::Convert($kind, [object]),
+    $E::Convert($E::Property($a, 'Pin'), [object]), $E::Convert($box, [object])))
+  $answered = $E::AndAlso($E::Call($box, $tryTake, [System.Linq.Expressions.Expression[]]@($decision, $E::Constant($waitMs, [int]))), $decision)
+  $body = $E::Block([System.Linq.Expressions.ParameterExpression[]]@($box, $decision), [System.Linq.Expressions.Expression[]]@(
+    $E::IfThen((KindIs 'ConfirmPinMatch'), $E::Assign($box, $newBox)),
+    $E::IfThen($E::OrElse((KindIs 'ConfirmOnly'), (KindIs 'DisplayPin')), $accept),
+    $E::Call($E::Constant($queue), $enqueue, [System.Linq.Expressions.Expression[]]@($item)),
+    $E::IfThen($E::AndAlso($E::NotEqual($box, $E::Constant($null, $boxT)), $answered), $accept)))
+  $E::Lambda($delegateType, $body, [System.Linq.Expressions.ParameterExpression[]]@($s, $a)).Compile()
+}
+"""
+
 # Long-lived pairing helper. Reads one command per line on stdin (accept, reject, cancel; end of input = cancel) and
 # writes one JSON object per line on stdout. It always ends by itself within PAIR_TIMEOUT seconds.
 PAIR_SCRIPT = r"""function Emit($o) { [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject $o)); [Console]::Out.Flush() }
-$custom = $null; $token = $null; $op = $null
+$custom = $null; $token = $null; $op = $null; $pending = $null
 try {
-""" + PRELUDE + EXPRESSIONS + r"""
+""" + PRELUDE + EXPRESSIONS + PAIR_HANDLER + r"""
   $deadline = [DateTime]::UtcNow.AddSeconds(%(timeout)d)
   $d = Await ($DI::CreateFromIdAsync('%(id)s', $props, $AEP)) ([Windows.Devices.Enumeration.DeviceInformation])
   if ($d.Pairing.IsPaired) { Emit @{ event = 'result'; status = 'AlreadyPaired' }; return }
-  # Handler: (sender, args) => queue.Enqueue(new object[] { args, args.GetDeferral() }). The deferral is taken on the
-  # event thread, so the pairing waits while this script (or the user) decides.
   $tReq = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceInformationCustomPairing, Windows.Devices.Enumeration.DevicePairingRequestedEventArgs]]
-  $ps = $tReq.GetMethod('Invoke').GetParameters()
-  $s = $E::Parameter($ps[0].ParameterType, 's')
-  $a = $E::Parameter($ps[1].ParameterType, 'a')
-  $deferral = $E::Call($a, $ps[1].ParameterType.GetMethod('GetDeferral'))
-  $item = $E::NewArrayInit([object], [System.Linq.Expressions.Expression[]]@($E::Convert($a, [object]), $E::Convert($deferral, [object])))
-  $body = $E::Call($E::Constant($queue), $enqueue, [System.Linq.Expressions.Expression[]]@($item))
-  $handler = $E::Lambda($tReq, $body, [System.Linq.Expressions.ParameterExpression[]]@($s, $a)).Compile()
+  # The handler waits a little longer than this script does, so the script's own time limit always answers first.
+  $handler = New-PairingHandler $tReq ((%(pin_timeout)d + 10) * 1000)
   $custom = $d.Pairing.Custom
   $token = $custom.add_PairingRequested($handler)
   $kinds = [Windows.Devices.Enumeration.DevicePairingKinds]'ConfirmOnly, DisplayPin, ProvidePin, ConfirmPinMatch'
@@ -161,7 +195,6 @@ try {
   Emit @{ event = 'pairing' }
   $reader = New-Object System.IO.StreamReader([Console]::OpenStandardInput())
   $line = $reader.ReadLineAsync()
-  $pending = $null
   $cancelled = $null
   while (-not $task.IsCompleted) {
     $cmd = ''
@@ -170,7 +203,8 @@ try {
     }
     if ($cmd -eq 'cancel' -or [DateTime]::UtcNow -gt $deadline) {
       $cancelled = $(if ($cmd -eq 'cancel') { 'user' } else { 'timeout' })
-      if ($pending) { $pending.deferral.Complete(); $pending = $null }
+      # Release a handler that waits for an answer, so no event thread stays blocked.
+      if ($pending) { $pending.box.Add($false); $pending = $null }
       $cts.Cancel()
       # Task.Wait would throw on a cancelled task; WaitAny only waits.
       [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($task), 5000)
@@ -178,26 +212,26 @@ try {
     }
     if ($pending) {
       if ($cmd -eq 'accept') {
-        $pending.args.Accept(); $pending.deferral.Complete(); $pending = $null; Emit @{ event = 'accepted' }
+        $pending.box.Add($true); $pending = $null; Emit @{ event = 'accepted' }
       } elseif ($cmd -eq 'reject' -or [DateTime]::UtcNow -gt $pending.until) {
-        $pending.deferral.Complete(); $pending = $null
+        $pending.box.Add($false); $pending = $null
         Emit @{ event = 'rejected'; reason = $(if ($cmd -eq 'reject') { 'user' } else { 'timeout' }) }
       }
     }
     $req = $null
     if ($queue.TryDequeue([ref]$req)) {
-      $ra = $req[0]; $rd = $req[1]; $kind = $ra.PairingKind.ToString()
+      $kind = $req[0].ToString(); $pin = [string]$req[1]
       if ($kind -eq 'ConfirmOnly') {
-        $ra.Accept(); $rd.Complete(); Emit @{ event = 'accepted'; kind = $kind }
+        Emit @{ event = 'accepted'; kind = $kind }  # already accepted by the handler
       } elseif ($kind -eq 'DisplayPin') {
-        # The PIN is typed on the other device; nothing to decide here (as in Microsoft's custom pairing sample).
-        $ra.Accept(); $rd.Complete(); Emit @{ event = 'pin'; kind = $kind; pin = $ra.Pin }
+        # Accepted by the handler; the PIN is typed on the other device (as in Microsoft's custom pairing sample).
+        Emit @{ event = 'pin'; kind = $kind; pin = $pin }
       } elseif ($kind -eq 'ConfirmPinMatch') {
-        if ($pending) { $pending.deferral.Complete() }
-        $pending = @{ args = $ra; deferral = $rd; until = [DateTime]::UtcNow.AddSeconds(%(pin_timeout)d) }
-        Emit @{ event = 'pin'; kind = $kind; pin = $ra.Pin }
+        if ($pending) { $pending.box.Add($false) }
+        $pending = @{ box = $req[2]; until = [DateTime]::UtcNow.AddSeconds(%(pin_timeout)d) }
+        Emit @{ event = 'pin'; kind = $kind; pin = $pin }
       } else {
-        $rd.Complete(); Emit @{ event = 'unsupported'; kind = $kind }
+        Emit @{ event = 'unsupported'; kind = $kind }  # refused by the handler
       }
     }
     Start-Sleep -Milliseconds 100
@@ -213,6 +247,7 @@ try {
 } catch {
   Emit @{ event = 'error'; message = $_.Exception.Message }
 } finally {
+  if ($pending) { try { $pending.box.Add($false) } catch { } }
   if ($null -ne $token) { try { $custom.remove_PairingRequested($token) } catch { } }
 }"""
 
@@ -224,18 +259,22 @@ def _check_id(device_id: str) -> str:
 
 
 def device_type(category: str, major: Any = None) -> str:
-    """audio / input / phone / computer / other, from the AEP category (e.g. "Audio.Speakers", "Input.Mouse"), falling
-    back to the classic Bluetooth major device class."""
-    first = (category or "").split(",")[0].split(".")[0].lower()
-    if first in ("audio", "input", "phone", "computer"):
-        return first
-    if first in ("communication",):
-        return "phone"
+    """audio / input / phone / computer / other. The classic Bluetooth major device class decides when it is one of
+    these (Bluetooth Assigned Numbers: 1 computer, 2 phone, 4 audio/video, 5 peripheral); otherwise the AEP category
+    (e.g. "Audio.Speakers", "Input.Mouse"). Headsets report "Communication.Headset.Bluetooth" as their category, so a
+    Communication category is a phone only when it is not a headset or hands-free device."""
     try:
-        # Bluetooth Assigned Numbers, major device classes: 1 computer, 2 phone, 4 audio/video, 5 peripheral.
-        return {1: "computer", 2: "phone", 4: "audio", 5: "input"}.get(int(major), "other")
+        by_major = {1: "computer", 2: "phone", 4: "audio", 5: "input"}.get(int(major))
     except (TypeError, ValueError):
-        return "other"
+        by_major = None
+    if by_major:
+        return by_major
+    parts = (category or "").split(",")[0].lower().split(".")
+    if parts[0] in ("audio", "input", "phone", "computer"):
+        return parts[0]
+    if parts[0] == "communication":
+        return "audio" if len(parts) > 1 and parts[1] in ("headset", "handsfree") else "phone"
+    return "other"
 
 
 def _device(raw: dict) -> dict:
@@ -321,7 +360,8 @@ RESULT_MESSAGES = {
     "AccessDenied": "Windows denied access.",
     "InvalidCeremonyData": "The device sent invalid pairing data.",
     "PairingCanceled": "Pairing was cancelled.",
-    "OperationAlreadyInProgress": "Windows is already pairing a device. Try again in a moment.",
+    "OperationAlreadyInProgress": "Windows is still busy with an earlier pairing. Turn Bluetooth off and on, "
+                                  "or restart the device, then try again.",
     "RequiredHandlerNotRegistered": "Pairing needs a step this panel does not support.",
     "RejectedByHandler": "Pairing was cancelled.",
     "RemoteDeviceHasAssociation": "The device is paired with something else. Reset it and try again.",

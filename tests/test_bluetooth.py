@@ -1,14 +1,17 @@
 import asyncio
 import json
 import queue
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 import main
 from wqs import bluetooth
-from wqs.runner import POWERSHELL, PowerShellError, decode_script
+from wqs.runner import POWERSHELL, PowerShellError, decode_script, run_powershell
 
 SPEAKER = "Bluetooth#Bluetooth48:45:e6:0b:c7:0e-2c:8d:48:2f:a2:a9"
 MOUSE = "BluetoothLE#BluetoothLE48:45:e6:0b:c7:0e-f0:b1:6f:50:a4:1c"
@@ -63,9 +66,22 @@ def test_list_paired_single_object_empty_and_unnamed():
     ("Communication.Phone", None, "phone"), ("Computer.Laptop", None, "computer"), ("", 4, "audio"),
     ("", 2, "phone"), ("", 31, "other"), ("Other", "x", "other"), ("", None, "other"),
     ("Audio.Speakers,Input.Keyboard", None, "audio"),
+    # Headsets: category Communication.Headset.*; the major class (4 audio/video) decides first.
+    ("Communication.Headset.Bluetooth", 4, "audio"), ("Communication.Headset.Bluetooth", None, "audio"),
+    ("Communication.Handsfree", None, "audio"), ("Communication.Phone", 2, "phone"),
+    ("Communication.Headset", 31, "audio"), ("Input.Gaming", 5, "input"),
 ])
 def test_device_type(category, major, expected):
     assert bluetooth.device_type(category, major) == expected
+
+
+def test_list_paired_real_headphones_are_audio():
+    # Read from the soundcore Space One (classic BT headphones): Category Communication.Headset.Bluetooth,
+    # Cod.Major 4 (audio/video), Cod.Minor 1. They were listed as "phone" before.
+    out = json.dumps([{"id": "Bluetooth#Bluetooth48:45:e6:0b:c7:0e-f4:9d:8a:37:9a:e9", "name": "soundcore Space One",
+                       "paired": True, "connected": True, "category": "Communication.Headset.Bluetooth", "major": 4,
+                       "le": False}])
+    assert bluetooth.list_paired(FakeRunner(out))[0]["type"] == "audio"
 
 
 def test_list_paired_error_raises():
@@ -214,10 +230,54 @@ def test_pair_script_has_id_timeouts_and_all_kinds():
     assert f"CreateFromIdAsync('{NEW}'" in script
     assert "AddSeconds(90)" in script and "AddSeconds(45)" in script
     assert "'ConfirmOnly, DisplayPin, ProvidePin, ConfirmPinMatch'" in script
-    assert "GetDeferral" in script and "remove_PairingRequested" in script
-    # A cancelled task must not throw on the wait after $op.Cancel().
+    assert "remove_PairingRequested" in script
+    # Requests are answered in the handler, not later through a deferral (Windows ignores that Accept()).
+    assert "GetDeferral" not in script and ".Complete()" not in script
+    # The handler waits longer than the script, which feeds false on its own time limit, cancel and exit.
+    assert "New-PairingHandler $tReq ((45 + 10) * 1000)" in script
+    assert script.count("$pending.box.Add($false)") == 4 and "$pending.box.Add($true)" in script
+    # A cancelled task must not throw on the wait after $cts.Cancel().
     assert "Task]::WaitAny(" in script and ".Wait(5000)" not in script
     proc.end()
+
+
+def test_pair_command_line_fits_windows_limit():
+    argv = bluetooth.powershell_argv(bluetooth.PAIR_SCRIPT % {"id": NEW, "timeout": 120, "pin_timeout": 60})
+    assert len(subprocess.list2cmdline(argv)) < 32000  # CreateProcess limit is 32767 characters
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs Windows PowerShell 5.1")
+def test_pair_handler_expression_tree_with_stub_types():
+    """Compiles the real New-PairingHandler for a stub delegate and args type (no Bluetooth) and fires it on
+    thread-pool threads, as WinRT does."""
+    stub = (Path(__file__).parent / "pair_handler_stub.ps1").read_text(encoding="utf-8")
+    out = run_powershell(bluetooth.PRELUDE + bluetooth.EXPRESSIONS + bluetooth.PAIR_HANDLER + stub, timeout=90)
+    r = json.loads(out.splitlines()[-1])
+    # ConfirmOnly and DisplayPin: accepted inside the handler, on the event thread.
+    for name, pin in (("confirm_only", ""), ("display_pin", "4321")):
+        assert r[name]["accepted"] == 1 and r[name]["otherThread"] is True and r[name]["pin"] == pin
+        assert r[name]["hasBox"] is False and r[name]["done"] is True
+    # Unsupported: returns at once without accepting.
+    assert r["provide_pin"]["accepted"] == 0 and r["provide_pin"]["done"] is True
+    # ConfirmPinMatch: the handler blocks until the answer, then accepts on its own thread.
+    acc = r["match_accept"]
+    assert acc["pin"] == "123456" and acc["hasBox"] is True and acc["blocked"] is True
+    assert acc["acceptedWhileBlocked"] == 0 and acc["accepted"] == 1 and acc["otherThread"] is True
+    rej = r["match_reject"]
+    assert rej["blocked"] is True and rej["done"] is True and rej["accepted"] == 0
+    # No answer: the handler gives up after its wait and does not accept.
+    assert r["match_timeout"]["done"] is True and r["match_timeout"]["accepted"] == 0
+
+
+def test_operation_already_in_progress_message():
+    proc = FakeProc()
+    s = bluetooth.PairingSession(NEW, spawn=spawner(proc))
+    s.start()
+    proc.emit(event="result", status="OperationAlreadyInProgress")
+    proc.end()
+    st = wait_for(s, lambda st: not st["active"])
+    assert st["message"] == ("Windows is still busy with an earlier pairing. Turn Bluetooth off and on, or restart "
+                             "the device, then try again.")
 
 
 def test_confirm_only_auto_accepted_then_paired():

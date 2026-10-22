@@ -16,7 +16,7 @@ A section is hidden when its control is not available: brightness on desktops wi
 
 Shown when the PC has a Bluetooth radio. When the radio is off, the section only says "Bluetooth is off".
 
-- **Paired devices** (classic and LE) are read each time the panel opens and after every action, with name, connected or not, and a type icon (audio, input, phone, computer, other) from the endpoint's `System.Devices.Aep.Category`, falling back to the classic major device class. The query uses the system's "paired" selectors, which do not start an inquiry, so it takes well under a second.
+- **Paired devices** (classic and LE) are read each time the panel opens and after every action, with name, connected or not, and a type icon (audio, input, phone, computer, other) from the classic Bluetooth major device class when it is computer, phone, audio/video or peripheral, otherwise from the endpoint's `System.Devices.Aep.Category` (headsets report `Communication.Headset.*` and count as audio). The query uses the system's "paired" selectors, which do not start an inquiry, so it takes well under a second.
 - **Search for devices** watches for unpaired classic and LE devices for 12 seconds. Devices without a name are not listed.
 - **Pair**: tap a found device. Pairing runs in the panel, never through a Windows dialog (those would open behind Big Picture):
   - "Confirm only" requests are accepted automatically.
@@ -24,10 +24,11 @@ Shown when the PC has a Bluetooth radio. When the radio is off, the section only
   - "Display PIN": the panel shows the PIN to type on the device (keyboards), with "Cancel".
   - Devices that need a PIN typed in on this side, or a user name and password, are not supported yet; pairing stops with a message saying so.
   - A pairing attempt ends by itself after 120 seconds.
+  - "Windows is still busy with an earlier pairing": a pairing that did not finish can leave Windows' pairing service stuck, and every new attempt fails at once. Turning Bluetooth off and on may clear it; if not, restart the PC.
 - **Remove**: tap a paired device, then confirm.
 - **Connect / Disconnect** are not offered. Windows has no public API to connect or disconnect a paired classic audio device (A2DP/HFP). `BluetoothSetServiceState` works by removing and reinstalling the device's drivers, so it is not used. An LE device stays connected only while some program holds it open. Paired devices reconnect by themselves when they are turned on; classic audio devices say so in their status line.
 
-How pairing works: WinRT raises `PairingRequested` on a thread-pool thread, where a PowerShell script block cannot run, and `Register-ObjectEvent` returns before the pairing deferral can be taken. So the pairing runs in a PowerShell helper process whose event handlers are compiled in memory from `System.Linq.Expressions` (no compiler, no file on disk). The handler takes the deferral and queues the request; the helper answers it and talks to the plugin in JSON lines over stdin/stdout (`accept`, `reject`, `cancel`; closing stdin also cancels). A timer in the plugin kills a helper that has not finished 20 seconds after its own time limit. When a new pairing starts, the running helper is asked to cancel and killed if it has not exited within 6 seconds (3 seconds on plugin unload). Calls that start, cancel or dismiss a pairing run one at a time. The result of a finished pairing stays in the panel until you press OK.
+How pairing works: WinRT raises `PairingRequested` on a thread-pool thread, where a PowerShell script block cannot run, and `Register-ObjectEvent` returns before the request can be answered. So the pairing runs in a PowerShell helper process whose event handler is compiled in memory from `System.Linq.Expressions` (no compiler, no file on disk). The handler answers the request itself, on the event thread: Windows ignores an `Accept()` made later from another thread through the request's deferral, and the device then fails authentication. "Confirm only" and "Display PIN" are accepted at once. For "Confirm PIN match" the handler blocks its thread on a per-request `BlockingCollection<bool>` until the helper passes the user's answer, then accepts (or not); on cancel or the 60-second limit the helper passes "no", and the handler gives up by itself 10 seconds later in any case. Other kinds are refused. The helper talks to the plugin in JSON lines over stdin/stdout (`accept`, `reject`, `cancel`; closing stdin also cancels). A timer in the plugin kills a helper that has not finished 20 seconds after its own time limit. When a new pairing starts, the running helper is asked to cancel and killed if it has not exited within 6 seconds (3 seconds on plugin unload). Calls that start, cancel or dismiss a pairing run one at a time. The result of a finished pairing stays in the panel until you press OK.
 
 ## Battery charge limit
 
@@ -62,3 +63,5 @@ The backend helpers take injected runners (and the pairing session an injected h
 ```
 python -m pytest -q tests
 ```
+
+On Windows, one test also compiles the real pairing handler against stub types (`tests/pair_handler_stub.ps1`, built with `Add-Type`) and fires it on thread-pool threads; it never touches Bluetooth.
