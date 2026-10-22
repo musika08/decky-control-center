@@ -36,6 +36,7 @@ const startPairing = callable<[deviceId: string, name: string], Pairing>('start_
 const getPairing = callable<[], Pairing>('get_pairing');
 const respondPairing = callable<[accept: boolean], Pairing>('respond_pairing');
 const cancelPairing = callable<[], Pairing>('cancel_pairing');
+const dismissPairing = callable<[], Pairing>('dismiss_pairing');
 const getBattery = callable<[], Battery>('get_battery');
 const setBatteryLimit = callable<[limit: number], SetResult>('set_battery_limit');
 
@@ -190,9 +191,10 @@ function DeviceIcon({ type }: { type: BtDevice['type'] }) {
 }
 
 // Windows has no public API to connect or disconnect a paired classic audio device, and an LE device stays connected
-// only while some app holds it, so there are no Connect/Disconnect buttons: say what Windows does instead.
+// only while some app holds it, so there are no Connect/Disconnect buttons. Classic audio devices get a hint instead.
 function statusText(d: BtDevice) {
-  return d.connected ? 'Connected' : 'Not connected. Reconnects automatically when turned on.';
+  if (d.connected) return 'Connected';
+  return d.type === 'audio' && !d.le ? 'Not connected. Reconnects automatically when turned on.' : 'Not connected';
 }
 
 const PIN_STYLE = { fontSize: '1.4em', fontWeight: 'bold', letterSpacing: '0.1em' } as const;
@@ -334,6 +336,8 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
   const [searching, setSearching] = useState(false);
   const [pairing, setPairing] = useState<Pairing | null>(null);
   const mounted = useRef(true);
+  // True while start_pairing is in flight: polls then may still see the previous (or no) session, so ignore them.
+  const starting = useRef(false);
   useEffect(
     () => () => {
       mounted.current = false;
@@ -353,7 +357,7 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
     // Pick up a pairing that was still running (or finished) while the panel was closed.
     getPairing()
       .then((p) => {
-        if (mounted.current && p.stage !== 'idle') setPairing(p);
+        if (mounted.current && !starting.current && p.stage !== 'idle') setPairing(p);
       })
       .catch(() => undefined);
   }, [radio.on]);
@@ -365,7 +369,7 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
     const timer = window.setInterval(() => {
       getPairing()
         .then((p) => {
-          if (!mounted.current) return;
+          if (!mounted.current || starting.current) return;
           setPairing(p);
           if (!p.active) {
             refresh();
@@ -402,19 +406,28 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
   };
 
   const pair = async (d: BtDevice) => {
+    starting.current = true;
     setPairing({ active: true, stage: 'starting', device_id: d.id, name: d.name, pin: null, kind: null, ok: null, message: null });
     try {
       const p = await startPairing(d.id, d.name);
       if (mounted.current) setPairing(p);
     } catch {
       if (mounted.current) setPairing(pairingFailed(d, 'The request failed.'));
+    } finally {
+      starting.current = false;
     }
+  };
+
+  const dismiss = () => {
+    setPairing(null);
+    // Forget the finished pairing in the backend too, so it does not show again when the panel reopens.
+    dismissPairing().catch(() => undefined);
   };
 
   return (
     <PanelSection title="Bluetooth devices">
       {pairing && pairing.stage !== 'idle' ? (
-        <PairingPanel state={pairing} onClose={() => setPairing(null)} />
+        <PairingPanel state={pairing} onClose={dismiss} />
       ) : (
         <>
           {paired && !paired.ok && (

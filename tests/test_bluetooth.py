@@ -116,7 +116,7 @@ def test_unpair_results(out, ok):
 
 
 @pytest.mark.parametrize("bad", ["", "x", SPEAKER + "'; Remove-Item C:\\", "Bluetooth#Bluetooth' + 'x", None, 5,
-                                 "USB#VID_1234"])
+                                 "USB#VID_1234", SPEAKER + "\n", " " + SPEAKER])
 def test_bad_ids_rejected_without_running(bad):
     r = FakeRunner()
     with pytest.raises(ValueError):
@@ -154,6 +154,8 @@ class FakeProc:
         self.on_command = on_command
         self.wait_hangs = wait_hangs
         self.argv = None
+        self.ended = False
+        self.wait_timeouts = []
 
     @property
     def stdout(self):
@@ -168,14 +170,16 @@ class FakeProc:
         self.out.put(json.dumps(event) + "\n")
 
     def end(self):
+        self.ended = True
         self.out.put(None)
 
     def poll(self):
         if self.wait_hangs and not self.killed:
             return None
-        return 0 if self.exited.is_set() or self.killed else None
+        return 0 if self.ended or self.exited.is_set() or self.killed else None
 
     def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
         if self.wait_hangs and not self.killed:
             raise TimeoutError()
         return 0
@@ -211,6 +215,8 @@ def test_pair_script_has_id_timeouts_and_all_kinds():
     assert "AddSeconds(90)" in script and "AddSeconds(45)" in script
     assert "'ConfirmOnly, DisplayPin, ProvidePin, ConfirmPinMatch'" in script
     assert "GetDeferral" in script and "remove_PairingRequested" in script
+    # A cancelled task must not throw on the wait after $op.Cancel().
+    assert "Task]::WaitAny(" in script and ".Wait(5000)" not in script
     proc.end()
 
 
@@ -395,6 +401,52 @@ def test_reader_kills_helper_that_does_not_exit():
     assert proc.killed is True
 
 
+def test_close_lets_helper_cancel_cleanly():
+    proc = FakeProc()
+    proc.on_command = lambda c: c == "cancel" and (proc.emit(event="cancelled", reason="user"), proc.end())
+    s = bluetooth.PairingSession(NEW, spawn=spawner(proc))
+    s.start()
+    proc.emit(event="pairing")
+    wait_for(s, lambda st: st["stage"] == "pairing")
+    s.close(grace=6)
+    assert proc.stdin.lines == ["cancel\n"]
+    assert proc.killed is False and 6 in proc.wait_timeouts
+    assert wait_for(s, lambda st: not st["active"])["message"] == "Pairing was cancelled."
+
+
+def test_close_kills_helper_that_ignores_cancel():
+    proc = FakeProc(wait_hangs=True)
+    s = bluetooth.PairingSession(NEW, spawn=spawner(proc))
+    s.start()
+    s.close(grace=3)
+    assert proc.stdin.lines == ["cancel\n"] and 3 in proc.wait_timeouts and proc.killed is True
+    assert s.snapshot()["active"] is False
+
+
+def test_backstop_timer_kills_without_polling():
+    proc = FakeProc()
+    s = bluetooth.PairingSession(NEW, spawn=spawner(proc), backstop=0.05)
+    s.start()
+    proc.emit(event="pairing")
+    end = time.time() + 2
+    while not proc.killed and time.time() < end:
+        time.sleep(0.01)  # no snapshot() calls here
+    assert proc.killed is True
+    st = s.snapshot()
+    assert st["active"] is False and st["status"] == "Timeout"
+
+
+def test_backstop_timer_cancelled_when_helper_ends():
+    proc = FakeProc()
+    s = bluetooth.PairingSession(NEW, spawn=spawner(proc), backstop=0.2)
+    s.start()
+    proc.emit(event="result", status="Paired")
+    proc.end()
+    wait_for(s, lambda st: not st["active"])
+    time.sleep(0.3)
+    assert proc.killed is False and s.snapshot()["ok"] is True
+
+
 def test_close_cancels_and_kills():
     proc = FakeProc()
     s = bluetooth.PairingSession(NEW, spawn=spawner(proc))
@@ -479,6 +531,63 @@ def test_main_pairing_flow_and_unload_cleanup(plugin, monkeypatch):
     assert procs[0].killed is True and len(procs) == 2
     run(plugin._unload())
     assert procs[1].killed is True and plugin._pairing is None
+
+
+def test_main_overlapping_starts_leave_one_helper(plugin, monkeypatch):
+    procs = []
+
+    def spawn(argv):
+        procs.append(FakeProc())
+        return procs[-1]
+    real = bluetooth.PairingSession
+    created = []
+
+    def make(i, n):
+        session = real(i, n, spawn=spawn)
+        created.append(session)
+        return session
+    monkeypatch.setattr(main.bluetooth, "PairingSession", make)
+
+    async def both():
+        return await asyncio.gather(plugin.start_pairing(NEW, "A"), plugin.start_pairing(MOUSE, "B"),
+                                    plugin.start_pairing(NEW, "C"))
+    run(both())
+    assert len(procs) == 3
+    alive = [p for p in procs if not p.killed]
+    assert len(alive) == 1
+    assert plugin._pairing is created[procs.index(alive[0])]
+    run(plugin._unload())
+    assert all(p.killed for p in procs) and plugin._pairing is None
+
+
+def test_main_dismiss_pairing(plugin, monkeypatch):
+    proc = FakeProc()
+    real = bluetooth.PairingSession
+    monkeypatch.setattr(main.bluetooth, "PairingSession", lambda i, n: real(i, n, spawn=spawner(proc)))
+    assert run(plugin.dismiss_pairing())["stage"] == "idle"
+    run(plugin.start_pairing(NEW, "Headset"))
+    # still running: dismiss keeps it
+    assert run(plugin.dismiss_pairing())["active"] is True
+    assert run(plugin.get_pairing())["active"] is True
+    proc.emit(event="result", status="Paired")
+    proc.end()
+    end = time.time() + 2
+    while run(plugin.get_pairing())["active"] and time.time() < end:
+        time.sleep(0.01)
+    assert run(plugin.get_pairing())["ok"] is True  # shown until dismissed
+    assert run(plugin.dismiss_pairing())["stage"] == "idle"
+    assert run(plugin.get_pairing())["stage"] == "idle"
+
+
+def test_main_unload_uses_short_grace(plugin, monkeypatch):
+    graces = []
+
+    class Session:
+        def close(self, grace):
+            graces.append(grace)
+    plugin._pairing = Session()
+    run(plugin._unload())
+    assert graces == [bluetooth.UNLOAD_GRACE] and bluetooth.UNLOAD_GRACE < 5
 
 
 def test_main_start_pairing_bad_id(plugin):

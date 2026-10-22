@@ -25,12 +25,14 @@ from .runner import CREATE_NO_WINDOW, Runner, powershell_argv, run_powershell
 SCAN_SECONDS = 12
 PAIR_TIMEOUT = 120  # the helper gives up on its own after this many seconds
 PIN_TIMEOUT = 60  # how long the helper waits for Confirm/Cancel on a PIN
-KILL_GRACE = 10  # extra seconds before Python kills a helper that did not exit by itself
+KILL_GRACE = 20  # extra seconds before Python kills a helper that did not exit by itself
+CLOSE_GRACE = 6  # seconds a replaced helper gets to cancel cleanly before it is killed
+UNLOAD_GRACE = 3  # the same on plugin unload (Decky stops the plugin host after 5 s)
 
 # Association endpoint ids as Windows reports them, e.g. Bluetooth#Bluetooth48:45:e6:0b:c7:0e-2c:8d:48:2f:a2:a9.
 # Only these are ever put into a script.
 _MAC = r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"
-DEVICE_ID = re.compile(rf"^Bluetooth(?:LE)?#Bluetooth(?:LE)?{_MAC}-{_MAC}$")
+DEVICE_ID = re.compile(rf"Bluetooth(?:LE)?#Bluetooth(?:LE)?{_MAC}-{_MAC}")  # used with fullmatch
 
 PRELUDE = r"""$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -162,7 +164,8 @@ try {
       $cancelled = $(if ($cmd -eq 'cancel') { 'user' } else { 'timeout' })
       if ($pending) { $pending.deferral.Complete(); $pending = $null }
       $op.Cancel()
-      [void]$task.Wait(5000)
+      # Task.Wait would throw on a cancelled task; WaitAny only waits.
+      [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($task), 5000)
       break
     }
     if ($pending) {
@@ -191,9 +194,10 @@ try {
     }
     Start-Sleep -Milliseconds 100
   }
+  # Our own cancel or time limit first, whatever the task ended as (Canceled, or a PairingCanceled result).
   if ($cancelled) { Emit @{ event = 'cancelled'; reason = $cancelled } }
-  elseif ($task.IsFaulted) { Emit @{ event = 'error'; message = $task.Exception.InnerException.Message } }
   elseif ($task.IsCanceled) { Emit @{ event = 'cancelled'; reason = 'system' } }
+  elseif ($task.IsFaulted) { Emit @{ event = 'error'; message = $task.Exception.InnerException.Message } }
   else {
     $r = $task.Result
     Emit @{ event = 'result'; status = $r.Status.ToString(); protection = $r.ProtectionLevelUsed.ToString() }
@@ -206,7 +210,7 @@ try {
 
 
 def _check_id(device_id: str) -> str:
-    if not isinstance(device_id, str) or not DEVICE_ID.match(device_id):
+    if not isinstance(device_id, str) or not DEVICE_ID.fullmatch(device_id):
         raise ValueError(f"not a Bluetooth device id: {device_id!r}")
     return device_id
 
@@ -326,7 +330,7 @@ class PairingSession:
 
     def __init__(self, device_id: str, name: str = "", spawn: Optional[Spawner] = None,
                  clock: Callable[[], float] = time.monotonic, timeout: float = PAIR_TIMEOUT,
-                 pin_timeout: float = PIN_TIMEOUT) -> None:
+                 pin_timeout: float = PIN_TIMEOUT, backstop: Optional[float] = None) -> None:
         self.device_id = _check_id(device_id)
         self.name = name or ""
         self._spawn = spawn or popen_spawner
@@ -336,6 +340,9 @@ class PairingSession:
         self._lock = threading.Lock()
         self._proc: Optional[HelperProcess] = None
         self._deadline = 0.0
+        # Kills the helper even when nobody polls; tests pass a short value.
+        self._backstop_after = timeout + KILL_GRACE if backstop is None else backstop
+        self._timer: Optional[threading.Timer] = None
         # stage: starting -> pairing -> (confirm | show_pin) -> done
         self._state: dict = {"stage": "starting", "pin": None, "kind": None, "ok": None, "message": None,
                              "status": None}
@@ -351,8 +358,19 @@ class PairingSession:
         except Exception as e:  # noqa: BLE001 - reported to the panel
             self._finish(False, f"Could not start pairing: {e}")
             return self.snapshot()
+        self._timer = threading.Timer(self._backstop_after, self._backstop)
+        self._timer.daemon = True
+        self._timer.start()
         threading.Thread(target=self._read, args=(self._proc,), name="wqs-bt-pair", daemon=True).start()
         return self.snapshot()
+
+    def _backstop(self) -> None:
+        proc = self._proc
+        with self._lock:
+            overdue = self._state["stage"] != "done"
+        if proc is not None and overdue:
+            self._kill(proc)
+            self._finish(False, "Pairing took too long and was stopped.", status="Timeout")
 
     def _read(self, proc: HelperProcess) -> None:
         try:
@@ -369,6 +387,8 @@ class PairingSession:
         except Exception:  # noqa: BLE001 - pipe closed by kill()
             pass
         self._reap(proc)
+        if self._timer is not None:
+            self._timer.cancel()
         with self._lock:
             unfinished = self._state["stage"] != "done"
         if unfinished:
@@ -389,12 +409,19 @@ class PairingSession:
         except Exception:  # noqa: BLE001
             pass
 
-    def close(self) -> None:
-        """Stop the helper now (plugin unload, or a new pairing started)."""
+    def close(self, grace: float = CLOSE_GRACE) -> None:
+        """Stop the helper (a new pairing started, or plugin unload): ask it to cancel, so the pairing operation is
+        cancelled and its handler removed, give it `grace` seconds to exit, then kill it."""
         proc = self._proc
         if proc is not None:
-            self._send("cancel")
+            if proc.poll() is None and self._send("cancel"):
+                try:
+                    proc.wait(timeout=grace)
+                except Exception:  # noqa: BLE001 - did not exit in time
+                    pass
             self._kill(proc)
+        if self._timer is not None:
+            self._timer.cancel()
         with self._lock:
             unfinished = self._state["stage"] != "done"
         if unfinished:
