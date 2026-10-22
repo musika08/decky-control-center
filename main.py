@@ -128,5 +128,8 @@ class Plugin:
                                   {"ok": False, "result": None})
         decky.logger.info(f"Battery charge limit set to {limit}: {res}")
         if res.get("ok"):
-            self.settings.set("battery_limit", int(limit))
+            try:
+                self.settings.set("battery_limit", int(limit))
+            except Exception as e:
+                decky.logger.error(f"Could not save the battery charge limit: {e!r}")
         return res

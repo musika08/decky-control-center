@@ -24,8 +24,14 @@ const setBatteryLimit = callable<[limit: number], SetResult>('set_battery_limit'
 function useThrottled(fn: (v: number) => unknown, ms: number) {
   const pending = useRef<number | null>(null);
   const timer = useRef<number | null>(null);
+  const fnRef = useRef(fn);
+  fnRef.current = fn;
+  // On unmount (panel closed mid-drag), send the last value instead of dropping it.
   useEffect(() => () => {
     if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = null;
+    if (pending.current !== null) fnRef.current(pending.current);
+    pending.current = null;
   }, []);
   return (v: number) => {
     pending.current = v;
@@ -84,7 +90,6 @@ function VolumeSection() {
           step={2}
           showValue
           valueSuffix="%"
-          disabled={state.muted}
           onChange={(v) => {
             setState({ ...state, level: v });
             send(v);
@@ -97,8 +102,13 @@ function VolumeSection() {
           checked={state.muted}
           onChange={async (muted) => {
             setState({ ...state, muted });
-            await setMute(muted);
-            setState(await getVolume());
+            try {
+              await setMute(muted);
+            } finally {
+              getVolume()
+                .then(setState)
+                .catch(() => undefined);
+            }
           }}
         />
       </PanelSectionRow>
@@ -120,10 +130,15 @@ function RadioToggle({ kind, label, radio, refresh }: { kind: 'wifi' | 'bluetoot
         onChange={async (on) => {
           setBusy(true);
           setError(null);
-          const res = await setRadio(kind, on);
-          if (!res.ok) setError(`Windows refused: ${res.detail ?? 'unknown'}`);
-          setBusy(false);
-          refresh();
+          try {
+            const res = await setRadio(kind, on);
+            if (!res.ok) setError(`Windows refused: ${res.detail ?? 'unknown'}`);
+          } catch {
+            setError('The request failed.');
+          } finally {
+            setBusy(false);
+            refresh();
+          }
         }}
       />
     </PanelSectionRow>
@@ -133,7 +148,9 @@ function RadioToggle({ kind, label, radio, refresh }: { kind: 'wifi' | 'bluetoot
 function RadiosSection() {
   const [state, setState] = useState<Radios | null>(null);
   const refresh = () => {
-    getRadios().then(setState);
+    getRadios()
+      .then(setState)
+      .catch(() => undefined);
   };
   useEffect(refresh, []);
   if (!state || (!state.wifi.present && !state.bluetooth.present)) return null;
@@ -170,10 +187,15 @@ function BatterySection() {
           onChange={async (on) => {
             setBusy(true);
             setError(null);
-            const res = await setBatteryLimit(on ? 80 : 100);
-            if (!res.ok) setError('The firmware did not accept the new limit.');
-            setState(await getBattery());
-            setBusy(false);
+            try {
+              const res = await setBatteryLimit(on ? 80 : 100);
+              if (!res.ok) setError('The firmware did not accept the new limit.');
+              setState(await getBattery());
+            } catch {
+              setError('The request failed.');
+            } finally {
+              setBusy(false);
+            }
           }}
         />
       </PanelSectionRow>

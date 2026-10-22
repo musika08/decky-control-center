@@ -87,3 +87,41 @@ def test_battery_probe_default_shape_matches_real_probe():
     # main.py's fallback must have the same keys as a real probe result.
     real = asus_acpi.probe(lambda: (_ for _ in ()).throw(OSError(2, "x")))
     assert set(real) == {"supported", "status", "error", "reason"}
+
+
+def _boom(*a, **k):
+    raise RuntimeError("device error")
+
+
+def test_raising_setters_return_failure_defaults(plugin, monkeypatch):
+    monkeypatch.setattr(main.radios, "set_radio", _boom)
+    monkeypatch.setattr(main.volume, "set_volume", _boom)
+    monkeypatch.setattr(main.volume, "set_mute", _boom)
+    monkeypatch.setattr(main.brightness, "set_brightness", _boom)
+    monkeypatch.setattr(main.asus_acpi, "set_charge_limit", _boom)
+    plugin._battery = {"supported": True, "status": "0x00010000", "error": None, "reason": "ok"}
+    assert run(plugin.set_radio("wifi", True)) == {"ok": False, "detail": "failed"}
+    assert run(plugin.set_volume(50)) is False
+    assert run(plugin.set_mute(True)) is False
+    assert run(plugin.set_brightness(50)) is False
+    assert run(plugin.set_battery_limit(80)) == {"ok": False, "result": None}
+    assert run(plugin.get_battery())["limit"] is None
+
+
+def test_battery_settings_save_failure_does_not_reject(plugin, monkeypatch):
+    plugin._battery = {"supported": True, "status": "0x00010000", "error": None, "reason": "ok"}
+    monkeypatch.setattr(main.asus_acpi, "set_charge_limit", lambda limit: {"ok": True, "result": "0x00000001"})
+    monkeypatch.setattr(plugin.settings, "set", _boom)
+    assert run(plugin.set_battery_limit(80)) == {"ok": True, "result": "0x00000001"}
+
+
+def test_main_does_no_device_io(plugin, monkeypatch):
+    for mod, names in ((main.brightness, ("get_brightness", "set_brightness")),
+                       (main.volume, ("get_volume", "set_volume", "set_mute")),
+                       (main.radios, ("get_radios", "set_radio")),
+                       (main.asus_acpi, ("probe", "set_charge_limit", "AtkAcpiDevice"))):
+        for name in names:
+            monkeypatch.setattr(mod, name, lambda *a, _n=name, **k: pytest.fail(f"_main called {_n}"))
+    monkeypatch.setattr(main.asyncio, "to_thread", lambda *a, **k: pytest.fail("_main ran blocking work"))
+    run(plugin._main())
+    run(plugin._unload())
