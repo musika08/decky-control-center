@@ -1,0 +1,11 @@
+{
+  "api_version": 1,
+  "name": "Windows Quick Settings",
+  "author": "Musika",
+  "flags": [],
+  "publish": {
+    "tags": ["windows", "brightness", "volume", "wifi", "bluetooth", "battery"],
+    "description": "Brightness, volume, Wi-Fi, Bluetooth and the ASUS battery charge limit from the Quick Access menu on Windows.",
+    "image": ""
+  }
+}

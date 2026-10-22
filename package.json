@@ -1,0 +1,30 @@
+{
+  "name": "windows-quick-settings",
+  "version": "0.1.0",
+  "description": "Decky plugin: Windows brightness, volume, radios and ASUS battery charge limit in the Quick Access menu.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "rollup -c",
+    "typecheck": "tsc --noEmit"
+  },
+  "author": "Musika",
+  "license": "GPL-3.0-or-later",
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^26.0.1",
+    "@rollup/plugin-json": "^6.1.0",
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "@rollup/plugin-replace": "^5.0.7",
+    "@rollup/plugin-typescript": "^11.1.6",
+    "rollup": "^4.22.4",
+    "rollup-plugin-delete": "^2.0.0",
+    "rollup-plugin-external-globals": "^0.10.0",
+    "tslib": "^2.6.3",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "@decky/api": "^1.1.3",
+    "@decky/ui": "^4.15.1",
+    "react-icons": "^5.2.1"
+  }
+}

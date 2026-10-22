@@ -1,0 +1,4 @@
+{
+  "include": ["main.py", "py_modules"],
+  "extraPaths": ["py_modules"]
+}
