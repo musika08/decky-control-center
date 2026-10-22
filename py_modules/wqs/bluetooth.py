@@ -40,6 +40,13 @@ $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
   $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
 } | Select-Object -First 1
 function AsTask($op, [Type]$type) { $asTask.MakeGenericMethod($type).Invoke($null, @($op)) }
+# PowerShell cannot call Cancel() on the WinRT operation's COM wrapper, so cancellable waits go through
+# AsTask(operation, CancellationToken) and cancel the token instead.
+$asTaskCt = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 2 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' -and
+  $_.GetParameters()[1].ParameterType -eq [System.Threading.CancellationToken]
+} | Select-Object -First 1
+function AsTaskCancellable($op, [Type]$type, [System.Threading.CancellationToken]$token) { $asTaskCt.MakeGenericMethod($type).Invoke($null, @($op, $token)) }
 function Await($op, [Type]$type) {
   $task = AsTask $op $type
   if (-not $task.Wait(15000)) { throw 'WinRT call timed out' }
@@ -149,7 +156,8 @@ try {
   $token = $custom.add_PairingRequested($handler)
   $kinds = [Windows.Devices.Enumeration.DevicePairingKinds]'ConfirmOnly, DisplayPin, ProvidePin, ConfirmPinMatch'
   $op = $custom.PairAsync($kinds)
-  $task = AsTask $op ([Windows.Devices.Enumeration.DevicePairingResult])
+  $cts = New-Object System.Threading.CancellationTokenSource
+  $task = AsTaskCancellable $op ([Windows.Devices.Enumeration.DevicePairingResult]) $cts.Token
   Emit @{ event = 'pairing' }
   $reader = New-Object System.IO.StreamReader([Console]::OpenStandardInput())
   $line = $reader.ReadLineAsync()
@@ -163,7 +171,7 @@ try {
     if ($cmd -eq 'cancel' -or [DateTime]::UtcNow -gt $deadline) {
       $cancelled = $(if ($cmd -eq 'cancel') { 'user' } else { 'timeout' })
       if ($pending) { $pending.deferral.Complete(); $pending = $null }
-      $op.Cancel()
+      $cts.Cancel()
       # Task.Wait would throw on a cancelled task; WaitAny only waits.
       [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($task), 5000)
       break
