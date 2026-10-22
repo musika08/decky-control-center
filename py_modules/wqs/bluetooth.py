@@ -1,0 +1,488 @@
+"""Bluetooth devices through WinRT Windows.Devices.Enumeration, via Windows PowerShell 5.1. No admin needed.
+
+- Paired list: DeviceInformation.FindAllAsync over the association endpoints (AEP) of the classic and LE Bluetooth
+  protocols, with the system's own "paired" selectors (they do not start an inquiry, so this takes well under a second).
+- Search: two DeviceWatchers over the "unpaired" selectors (these do start an inquiry) for SCAN_SECONDS.
+- Pairing: DeviceInformationCustomPairing.PairAsync in a long-lived PowerShell helper that speaks JSON lines.
+- Remove: DeviceInformationPairing.UnpairAsync.
+
+WinRT events (DeviceWatcher.Added, PairingRequested) fire on thread-pool threads. A PowerShell script block cannot run
+there (no runspace), and Register-ObjectEvent queues the event and returns at once, too late to take the pairing
+deferral. So the handlers are built with System.Linq.Expressions and compiled in memory: they only take the deferral
+(for pairing) and put the event on a ConcurrentQueue that the script drains on its own thread. Nothing is written to
+disk and no compiler runs.
+"""
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+from typing import Any, Callable, Optional, Protocol
+
+from .runner import CREATE_NO_WINDOW, Runner, powershell_argv, run_powershell
+
+SCAN_SECONDS = 12
+PAIR_TIMEOUT = 120  # the helper gives up on its own after this many seconds
+PIN_TIMEOUT = 60  # how long the helper waits for Confirm/Cancel on a PIN
+KILL_GRACE = 10  # extra seconds before Python kills a helper that did not exit by itself
+
+# Association endpoint ids as Windows reports them, e.g. Bluetooth#Bluetooth48:45:e6:0b:c7:0e-2c:8d:48:2f:a2:a9.
+# Only these are ever put into a script.
+_MAC = r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"
+DEVICE_ID = re.compile(rf"^Bluetooth(?:LE)?#Bluetooth(?:LE)?{_MAC}-{_MAC}$")
+
+PRELUDE = r"""$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+} | Select-Object -First 1
+function AsTask($op, [Type]$type) { $asTask.MakeGenericMethod($type).Invoke($null, @($op)) }
+function Await($op, [Type]$type) {
+  $task = AsTask $op $type
+  if (-not $task.Wait(15000)) { throw 'WinRT call timed out' }
+  $task.Result
+}
+[void][Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType = WindowsRuntime]
+[void][Windows.Devices.Bluetooth.BluetoothDevice, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
+[void][Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
+$DI = [Windows.Devices.Enumeration.DeviceInformation]
+$AEP = [Windows.Devices.Enumeration.DeviceInformationKind]::AssociationEndpoint
+# PowerShell unrolls the WinRT property map into key/value pairs, so look the key up by walking them.
+function Prop($d, [string]$key) { foreach ($kv in $d.Properties) { if ($kv.Key -eq $key) { return $kv.Value } } }
+function PropList([string[]]$names) {
+  $l = New-Object 'System.Collections.Generic.List[string]'
+  foreach ($n in $names) { $l.Add($n) }
+  ,$l
+}
+$props = PropList @('System.Devices.Aep.IsPaired', 'System.Devices.Aep.IsConnected', 'System.Devices.Aep.Category',
+  'System.Devices.Aep.Bluetooth.Cod.Major')
+function Describe($d) {
+  [pscustomobject]@{
+    id = $d.Id; name = $d.Name; paired = [bool](Prop $d 'System.Devices.Aep.IsPaired')
+    connected = [bool](Prop $d 'System.Devices.Aep.IsConnected')
+    category = @(Prop $d 'System.Devices.Aep.Category') -join ','
+    major = Prop $d 'System.Devices.Aep.Bluetooth.Cod.Major'
+    le = $d.Id.StartsWith('BluetoothLE#')
+  }
+}
+"""
+
+LIST_SCRIPT = PRELUDE + r"""$found = foreach ($sel in @([Windows.Devices.Bluetooth.BluetoothDevice]::GetDeviceSelectorFromPairingState($true),
+                            [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($true))) {
+  $all = Await ($DI::FindAllAsync($sel, $props, $AEP)) ([Windows.Devices.Enumeration.DeviceInformationCollection])
+  foreach ($d in $all) { Describe $d }
+}
+ConvertTo-Json -Compress -InputObject @($found | Where-Object { $_.paired })"""
+
+# Handlers compiled from expression trees: (sender, args) => queue.Enqueue(new object[] { tag, args }).
+EXPRESSIONS = r"""$E = [System.Linq.Expressions.Expression]
+$queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+$enqueue = $queue.GetType().GetMethod('Enqueue')
+function New-QueueHandler([Type]$delegateType, [string]$tag) {
+  $ps = $delegateType.GetMethod('Invoke').GetParameters()
+  $s = $E::Parameter($ps[0].ParameterType, 's')
+  $a = $E::Parameter($ps[1].ParameterType, 'a')
+  $item = $E::NewArrayInit([object], [System.Linq.Expressions.Expression[]]@($E::Constant($tag, [object]), $E::Convert($a, [object])))
+  $body = $E::Call($E::Constant($queue), $enqueue, [System.Linq.Expressions.Expression[]]@($item))
+  $E::Lambda($delegateType, $body, [System.Linq.Expressions.ParameterExpression[]]@($s, $a)).Compile()
+}
+"""
+
+SCAN_SCRIPT = PRELUDE + EXPRESSIONS + r"""$tInfo = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceWatcher, Windows.Devices.Enumeration.DeviceInformation]]
+$tUpdate = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceWatcher, Windows.Devices.Enumeration.DeviceInformationUpdate]]
+$watchers = foreach ($sel in @([Windows.Devices.Bluetooth.BluetoothDevice]::GetDeviceSelectorFromPairingState($false),
+                               [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($false))) {
+  $w = $DI::CreateWatcher($sel, $props, $AEP)
+  [void]$w.add_Added((New-QueueHandler $tInfo 'added'))
+  [void]$w.add_Updated((New-QueueHandler $tUpdate 'updated'))
+  [void]$w.add_Removed((New-QueueHandler $tUpdate 'removed'))
+  $w
+}
+$seen = @{}
+function Drain {
+  $item = $null
+  while ($queue.TryDequeue([ref]$item)) {
+    $tag = $item[0]; $a = $item[1]
+    if ($tag -eq 'added') { $seen[$a.Id] = $a }
+    elseif ($tag -eq 'updated') { if ($seen.ContainsKey($a.Id)) { $seen[$a.Id].Update($a) } }
+    else { $seen.Remove($a.Id) }
+  }
+}
+try {
+  foreach ($w in $watchers) { $w.Start() }
+  $until = [DateTime]::UtcNow.AddSeconds(%(seconds)d)
+  while ([DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 250; Drain }
+} finally {
+  foreach ($w in $watchers) { try { $w.Stop() } catch { } }
+}
+Drain
+ConvertTo-Json -Compress -InputObject @($seen.Values | ForEach-Object { Describe $_ } | Where-Object { -not $_.paired })"""
+
+UNPAIR_SCRIPT = PRELUDE + r"""$d = Await ($DI::CreateFromIdAsync('%(id)s', $props, $AEP)) ([Windows.Devices.Enumeration.DeviceInformation])
+if (-not $d.Pairing.IsPaired) { 'result:NotPaired'; return }
+$r = Await ($d.Pairing.UnpairAsync()) ([Windows.Devices.Enumeration.DeviceUnpairingResult])
+'result:' + $r.Status"""
+
+# Long-lived pairing helper. Reads one command per line on stdin (accept, reject, cancel; end of input = cancel) and
+# writes one JSON object per line on stdout. It always ends by itself within PAIR_TIMEOUT seconds.
+PAIR_SCRIPT = r"""function Emit($o) { [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject $o)); [Console]::Out.Flush() }
+$custom = $null; $token = $null; $op = $null
+try {
+""" + PRELUDE + EXPRESSIONS + r"""
+  $deadline = [DateTime]::UtcNow.AddSeconds(%(timeout)d)
+  $d = Await ($DI::CreateFromIdAsync('%(id)s', $props, $AEP)) ([Windows.Devices.Enumeration.DeviceInformation])
+  if ($d.Pairing.IsPaired) { Emit @{ event = 'result'; status = 'AlreadyPaired' }; return }
+  # Handler: (sender, args) => queue.Enqueue(new object[] { args, args.GetDeferral() }). The deferral is taken on the
+  # event thread, so the pairing waits while this script (or the user) decides.
+  $tReq = [Windows.Foundation.TypedEventHandler[Windows.Devices.Enumeration.DeviceInformationCustomPairing, Windows.Devices.Enumeration.DevicePairingRequestedEventArgs]]
+  $ps = $tReq.GetMethod('Invoke').GetParameters()
+  $s = $E::Parameter($ps[0].ParameterType, 's')
+  $a = $E::Parameter($ps[1].ParameterType, 'a')
+  $deferral = $E::Call($a, $ps[1].ParameterType.GetMethod('GetDeferral'))
+  $item = $E::NewArrayInit([object], [System.Linq.Expressions.Expression[]]@($E::Convert($a, [object]), $E::Convert($deferral, [object])))
+  $body = $E::Call($E::Constant($queue), $enqueue, [System.Linq.Expressions.Expression[]]@($item))
+  $handler = $E::Lambda($tReq, $body, [System.Linq.Expressions.ParameterExpression[]]@($s, $a)).Compile()
+  $custom = $d.Pairing.Custom
+  $token = $custom.add_PairingRequested($handler)
+  $kinds = [Windows.Devices.Enumeration.DevicePairingKinds]'ConfirmOnly, DisplayPin, ProvidePin, ConfirmPinMatch'
+  $op = $custom.PairAsync($kinds)
+  $task = AsTask $op ([Windows.Devices.Enumeration.DevicePairingResult])
+  Emit @{ event = 'pairing' }
+  $reader = New-Object System.IO.StreamReader([Console]::OpenStandardInput())
+  $line = $reader.ReadLineAsync()
+  $pending = $null
+  $cancelled = $null
+  while (-not $task.IsCompleted) {
+    $cmd = ''
+    if ($null -ne $line -and $line.IsCompleted) {
+      if ($null -eq $line.Result) { $cmd = 'cancel'; $line = $null } else { $cmd = $line.Result.Trim(); $line = $reader.ReadLineAsync() }
+    }
+    if ($cmd -eq 'cancel' -or [DateTime]::UtcNow -gt $deadline) {
+      $cancelled = $(if ($cmd -eq 'cancel') { 'user' } else { 'timeout' })
+      if ($pending) { $pending.deferral.Complete(); $pending = $null }
+      $op.Cancel()
+      [void]$task.Wait(5000)
+      break
+    }
+    if ($pending) {
+      if ($cmd -eq 'accept') {
+        $pending.args.Accept(); $pending.deferral.Complete(); $pending = $null; Emit @{ event = 'accepted' }
+      } elseif ($cmd -eq 'reject' -or [DateTime]::UtcNow -gt $pending.until) {
+        $pending.deferral.Complete(); $pending = $null
+        Emit @{ event = 'rejected'; reason = $(if ($cmd -eq 'reject') { 'user' } else { 'timeout' }) }
+      }
+    }
+    $req = $null
+    if ($queue.TryDequeue([ref]$req)) {
+      $ra = $req[0]; $rd = $req[1]; $kind = $ra.PairingKind.ToString()
+      if ($kind -eq 'ConfirmOnly') {
+        $ra.Accept(); $rd.Complete(); Emit @{ event = 'accepted'; kind = $kind }
+      } elseif ($kind -eq 'DisplayPin') {
+        # The PIN is typed on the other device; nothing to decide here (as in Microsoft's custom pairing sample).
+        $ra.Accept(); $rd.Complete(); Emit @{ event = 'pin'; kind = $kind; pin = $ra.Pin }
+      } elseif ($kind -eq 'ConfirmPinMatch') {
+        if ($pending) { $pending.deferral.Complete() }
+        $pending = @{ args = $ra; deferral = $rd; until = [DateTime]::UtcNow.AddSeconds(%(pin_timeout)d) }
+        Emit @{ event = 'pin'; kind = $kind; pin = $ra.Pin }
+      } else {
+        $rd.Complete(); Emit @{ event = 'unsupported'; kind = $kind }
+      }
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  if ($cancelled) { Emit @{ event = 'cancelled'; reason = $cancelled } }
+  elseif ($task.IsFaulted) { Emit @{ event = 'error'; message = $task.Exception.InnerException.Message } }
+  elseif ($task.IsCanceled) { Emit @{ event = 'cancelled'; reason = 'system' } }
+  else {
+    $r = $task.Result
+    Emit @{ event = 'result'; status = $r.Status.ToString(); protection = $r.ProtectionLevelUsed.ToString() }
+  }
+} catch {
+  Emit @{ event = 'error'; message = $_.Exception.Message }
+} finally {
+  if ($null -ne $token) { try { $custom.remove_PairingRequested($token) } catch { } }
+}"""
+
+
+def _check_id(device_id: str) -> str:
+    if not isinstance(device_id, str) or not DEVICE_ID.match(device_id):
+        raise ValueError(f"not a Bluetooth device id: {device_id!r}")
+    return device_id
+
+
+def device_type(category: str, major: Any = None) -> str:
+    """audio / input / phone / computer / other, from the AEP category (e.g. "Audio.Speakers", "Input.Mouse"), falling
+    back to the classic Bluetooth major device class."""
+    first = (category or "").split(",")[0].split(".")[0].lower()
+    if first in ("audio", "input", "phone", "computer"):
+        return first
+    if first in ("communication",):
+        return "phone"
+    try:
+        # Bluetooth Assigned Numbers, major device classes: 1 computer, 2 phone, 4 audio/video, 5 peripheral.
+        return {1: "computer", 2: "phone", 4: "audio", 5: "input"}.get(int(major), "other")
+    except (TypeError, ValueError):
+        return "other"
+
+
+def _device(raw: dict) -> dict:
+    kind = device_type(raw.get("category") or "", raw.get("major"))
+    return {
+        "id": raw.get("id") or "",
+        "name": (raw.get("name") or "").strip(),
+        "connected": bool(raw.get("connected")),
+        "type": kind,
+        "le": bool(raw.get("le")),
+    }
+
+
+def _parse_list(out: str) -> list[dict]:
+    data = json.loads(out) if out else []
+    if isinstance(data, dict):  # a one-item array can still come back as an object
+        data = [data]
+    devices = [_device(d) for d in data if isinstance(d, dict)]
+    return [d for d in devices if d["id"]]
+
+
+def list_paired(runner: Optional[Runner] = None) -> list[dict]:
+    """Paired classic and LE devices: [{id, name, connected, type, le}], sorted connected first, then by name."""
+    devices = _parse_list(run_powershell(LIST_SCRIPT, runner))
+    for d in devices:
+        if not d["name"]:
+            d["name"] = "Unnamed device"
+    return sorted(devices, key=lambda d: (not d["connected"], d["name"].lower()))
+
+
+def scan(seconds: int = SCAN_SECONDS, runner: Optional[Runner] = None) -> list[dict]:
+    """Unpaired devices found within `seconds`. Devices without a name are left out (Windows hides them too)."""
+    seconds = max(1, min(60, int(seconds)))
+    devices = _parse_list(run_powershell(SCAN_SCRIPT % {"seconds": seconds}, runner, timeout=seconds + 25))
+    named = {d["id"]: d for d in devices if d["name"]}
+    return sorted(named.values(), key=lambda d: d["name"].lower())
+
+
+def unpair(device_id: str, runner: Optional[Runner] = None) -> dict:
+    """{"ok": bool, "status": DeviceUnpairingResultStatus name}. ok is also true when it was not paired."""
+    out = run_powershell(UNPAIR_SCRIPT % {"id": _check_id(device_id)}, runner, timeout=30)
+    last = out.splitlines()[-1] if out else ""
+    if last.startswith("result:"):
+        status = last[len("result:"):]
+        return {"ok": status in ("Unpaired", "AlreadyUnpaired", "NotPaired"), "status": status}
+    return {"ok": False, "status": last or "no output"}
+
+
+# Pairing --------------------------------------------------------------------------------------------------------
+
+class HelperProcess(Protocol):
+    stdin: Any
+    stdout: Any
+
+    def poll(self) -> Optional[int]: ...
+    def wait(self, timeout: Optional[float] = None) -> int: ...
+    def kill(self) -> None: ...
+
+
+Spawner = Callable[[list[str]], HelperProcess]
+
+
+def popen_spawner(argv: list[str]) -> HelperProcess:
+    return subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, encoding="utf-8", errors="replace", bufsize=1,
+                            creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0)
+
+
+# DevicePairingResultStatus names -> plain English.
+RESULT_MESSAGES = {
+    "Paired": "Paired.",
+    "AlreadyPaired": "Already paired.",
+    "NotReadyToPair": "The device is not ready to pair. Put it in pairing mode and try again.",
+    "NotPaired": "The device did not pair.",
+    "ConnectionRejected": "The device refused the connection.",
+    "TooManyConnections": "The device has too many connections.",
+    "HardwareFailure": "Bluetooth hardware error.",
+    "AuthenticationTimeout": "The device did not answer in time.",
+    "AuthenticationNotAllowed": "The device does not allow pairing this way.",
+    "AuthenticationFailure": "The PIN or confirmation did not match.",
+    "NoSupportedProfiles": "Windows does not support this device.",
+    "ProtectionLevelCouldNotBeMet": "The device could not pair securely.",
+    "AccessDenied": "Windows denied access.",
+    "InvalidCeremonyData": "The device sent invalid pairing data.",
+    "PairingCanceled": "Pairing was cancelled.",
+    "OperationAlreadyInProgress": "Windows is already pairing a device. Try again in a moment.",
+    "RequiredHandlerNotRegistered": "Pairing needs a step this panel does not support.",
+    "RejectedByHandler": "Pairing was cancelled.",
+    "RemoteDeviceHasAssociation": "The device is paired with something else. Reset it and try again.",
+    "Failed": "Pairing failed.",
+}
+UNSUPPORTED_MESSAGES = {
+    "ProvidePin": "This device needs a PIN typed in here, which this panel does not support yet. "
+                  "Use Windows Settings to pair it.",
+}
+
+
+class PairingSession:
+    """One pairing attempt, driven by the PowerShell helper. Thread-safe; all methods return snapshot()."""
+
+    def __init__(self, device_id: str, name: str = "", spawn: Optional[Spawner] = None,
+                 clock: Callable[[], float] = time.monotonic, timeout: float = PAIR_TIMEOUT,
+                 pin_timeout: float = PIN_TIMEOUT) -> None:
+        self.device_id = _check_id(device_id)
+        self.name = name or ""
+        self._spawn = spawn or popen_spawner
+        self._clock = clock
+        self._timeout = timeout
+        self._pin_timeout = pin_timeout
+        self._lock = threading.Lock()
+        self._proc: Optional[HelperProcess] = None
+        self._deadline = 0.0
+        # stage: starting -> pairing -> (confirm | show_pin) -> done
+        self._state: dict = {"stage": "starting", "pin": None, "kind": None, "ok": None, "message": None,
+                             "status": None}
+        self._note: Optional[str] = None  # set by "unsupported"/"rejected", kept for the final message
+
+    # lifecycle
+    def start(self) -> dict:
+        script = PAIR_SCRIPT % {"id": self.device_id, "timeout": int(self._timeout),
+                                "pin_timeout": int(self._pin_timeout)}
+        self._deadline = self._clock() + self._timeout + KILL_GRACE
+        try:
+            self._proc = self._spawn(powershell_argv(script))
+        except Exception as e:  # noqa: BLE001 - reported to the panel
+            self._finish(False, f"Could not start pairing: {e}")
+            return self.snapshot()
+        threading.Thread(target=self._read, args=(self._proc,), name="wqs-bt-pair", daemon=True).start()
+        return self.snapshot()
+
+    def _read(self, proc: HelperProcess) -> None:
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    self.handle_event(event)
+        except Exception:  # noqa: BLE001 - pipe closed by kill()
+            pass
+        self._reap(proc)
+        with self._lock:
+            unfinished = self._state["stage"] != "done"
+        if unfinished:
+            self._finish(False, self._note or "Pairing stopped unexpectedly.")
+
+    def _reap(self, proc: HelperProcess) -> None:
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            self._kill(proc)
+
+    @staticmethod
+    def _kill(proc: HelperProcess) -> None:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def close(self) -> None:
+        """Stop the helper now (plugin unload, or a new pairing started)."""
+        proc = self._proc
+        if proc is not None:
+            self._send("cancel")
+            self._kill(proc)
+        with self._lock:
+            unfinished = self._state["stage"] != "done"
+        if unfinished:
+            self._finish(False, "Pairing was cancelled.")
+
+    # events from the helper
+    def handle_event(self, event: dict) -> None:
+        kind = event.get("event")
+        if kind == "pairing":
+            self._update(stage="pairing")
+        elif kind == "accepted":
+            with self._lock:
+                if self._state["stage"] == "confirm":
+                    self._state.update(stage="pairing", pin=None)
+        elif kind == "pin":
+            pin_kind = str(event.get("kind") or "")
+            stage = "confirm" if pin_kind == "ConfirmPinMatch" else "show_pin"
+            self._update(stage=stage, pin=str(event.get("pin") or ""), kind=pin_kind)
+        elif kind == "rejected":
+            self._note = ("Pairing was cancelled." if event.get("reason") == "user"
+                          else "No answer in time, so pairing was cancelled.")
+            self._update(stage="pairing", pin=None)
+        elif kind == "unsupported":
+            k = str(event.get("kind") or "")
+            self._note = UNSUPPORTED_MESSAGES.get(k, f"This device asks for a pairing step ({k}) this panel does not "
+                                                     "support. Use Windows Settings to pair it.")
+        elif kind == "cancelled":
+            reason = event.get("reason")
+            msg = {"user": "Pairing was cancelled.", "timeout": "Pairing took too long and was cancelled."}.get(
+                str(reason), self._note or "Windows cancelled pairing.")
+            self._finish(False, msg, status="Cancelled")
+        elif kind == "result":
+            status = str(event.get("status") or "Failed")
+            ok = status in ("Paired", "AlreadyPaired")
+            msg = RESULT_MESSAGES.get(status, f"Pairing failed ({status}).")
+            if not ok and self._note:
+                msg = self._note
+            self._finish(ok, msg, status=status)
+        elif kind == "error":
+            self._finish(False, f"Pairing failed: {event.get('message') or 'unknown error'}", status="Error")
+
+    def _update(self, **changes: Any) -> None:
+        with self._lock:
+            if self._state["stage"] != "done":
+                self._state.update(changes)
+
+    def _finish(self, ok: bool, message: str, status: Optional[str] = None) -> None:
+        with self._lock:
+            if self._state["stage"] == "done":
+                return
+            self._state.update(stage="done", ok=ok, message=message, status=status, pin=None)
+
+    # commands from the panel
+    def _send(self, command: str) -> bool:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return False
+        try:
+            proc.stdin.write(command + "\n")
+            proc.stdin.flush()
+            return True
+        except Exception:  # noqa: BLE001 - helper already gone
+            return False
+
+    def respond(self, accept: bool) -> dict:
+        with self._lock:
+            waiting = self._state["stage"] == "confirm"
+            if waiting:
+                self._state.update(stage="pairing", pin=None)
+        if waiting:
+            self._send("accept" if accept else "reject")
+        return self.snapshot()
+
+    def cancel(self) -> dict:
+        with self._lock:
+            active = self._state["stage"] != "done"
+        if active:
+            self._send("cancel")
+        return self.snapshot()
+
+    def snapshot(self) -> dict:
+        proc = self._proc
+        if proc is not None and self._clock() > self._deadline:
+            with self._lock:
+                overdue = self._state["stage"] != "done"
+            if overdue:
+                self._kill(proc)
+                self._finish(False, "Pairing took too long and was stopped.", status="Timeout")
+        with self._lock:
+            s = dict(self._state)
+        return {"active": s["stage"] != "done", "device_id": self.device_id, "name": self.name, **s}

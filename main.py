@@ -11,7 +11,7 @@ _PY_MODULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "py_modul
 if _PY_MODULES not in sys.path:
     sys.path.append(_PY_MODULES)
 
-from wqs import asus_acpi, brightness, radios, volume  # noqa: E402
+from wqs import asus_acpi, bluetooth, brightness, radios, volume  # noqa: E402
 
 ON_WINDOWS = sys.platform == "win32"
 T = TypeVar("T")
@@ -49,12 +49,17 @@ class Plugin:
         self._brightness_target: Optional[int] = None
         self._brightness_busy = False
         self._radio_lock = asyncio.Lock()
+        self._bt_scan_lock = asyncio.Lock()
+        self._pairing: Optional[bluetooth.PairingSession] = None
 
     async def _main(self) -> None:
         decky.logger.info("Windows Quick Settings started")
 
     async def _unload(self) -> None:
-        pass
+        # Never leave a pairing helper behind.
+        if self._pairing is not None:
+            await asyncio.to_thread(self._pairing.close)
+            self._pairing = None
 
     async def _guarded(self, name: str, fn: Callable[[], T], default: T) -> T:
         if not ON_WINDOWS:
@@ -109,6 +114,59 @@ class Plugin:
         async with self._radio_lock:
             return await self._guarded("set_radio", lambda: radios.set_radio(kind, on),
                                        {"ok": False, "detail": "failed"})
+
+    # Bluetooth devices
+    async def get_bluetooth_devices(self) -> dict:
+        devices = await self._guarded("get_bluetooth_devices", bluetooth.list_paired, None)
+        return {"ok": devices is not None, "devices": devices or []}
+
+    async def scan_bluetooth(self) -> dict:
+        """Takes about bluetooth.SCAN_SECONDS. A second call while one runs waits for it and scans again."""
+        async with self._bt_scan_lock:
+            devices = await self._guarded("scan_bluetooth", bluetooth.scan, None)
+        return {"ok": devices is not None, "devices": devices or []}
+
+    async def unpair_bluetooth(self, device_id: str) -> dict:
+        """Only called from the Remove confirmation in the panel."""
+        res = await self._guarded("unpair_bluetooth", lambda: bluetooth.unpair(device_id),
+                                  {"ok": False, "status": "failed"})
+        decky.logger.info(f"Unpair {device_id}: {res}")
+        return res
+
+    def _idle_pairing(self) -> dict:
+        return {"active": False, "stage": "idle", "device_id": None, "name": "", "pin": None, "kind": None,
+                "ok": None, "message": None, "status": None}
+
+    async def start_pairing(self, device_id: str, name: str = "") -> dict:
+        """Starts pairing in the background; the panel then polls get_pairing."""
+        if not ON_WINDOWS:
+            return {**self._idle_pairing(), "stage": "done", "ok": False, "message": "Not Windows."}
+        old, self._pairing = self._pairing, None
+        if old is not None:
+            await asyncio.to_thread(old.close)
+        try:
+            session = bluetooth.PairingSession(device_id, name)
+        except ValueError:
+            return {**self._idle_pairing(), "stage": "done", "ok": False, "message": "Unknown device."}
+        self._pairing = session
+        decky.logger.info(f"Pairing {device_id} ({name})")
+        return await asyncio.to_thread(session.start)
+
+    async def get_pairing(self) -> dict:
+        if self._pairing is None:
+            return self._idle_pairing()
+        return await asyncio.to_thread(self._pairing.snapshot)
+
+    async def respond_pairing(self, accept: bool) -> dict:
+        """The user's answer to "Does this PIN match?"."""
+        if self._pairing is None:
+            return self._idle_pairing()
+        return await asyncio.to_thread(self._pairing.respond, bool(accept))
+
+    async def cancel_pairing(self) -> dict:
+        if self._pairing is None:
+            return self._idle_pairing()
+        return await asyncio.to_thread(self._pairing.cancel)
 
     # ASUS battery charge limit
     async def get_battery(self) -> dict:
