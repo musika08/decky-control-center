@@ -803,7 +803,8 @@ function WifiNetworksSection({ radio }: { radio: Radio }) {
             <Field label={`Connect to ${prompt.ssid}`} description="Enter the network password." icon={<SignalIcon signal={prompt.signal} secured />} />
           </PanelSectionRow>
           <PanelSectionRow>
-            <TextField label="Password" value={password} bIsPassword={!showPassword} onChange={(e) => setPassword(e.target.value)} />
+            {/* Steam's TextField reads bIsPassword only when it mounts, so the key remounts it when "Show password" flips. */}
+            <TextField key={showPassword ? 'password-shown' : 'password-hidden'} label="Password" value={password} bIsPassword={!showPassword} onChange={(e) => setPassword(e.target.value)} />
           </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField label="Show password" checked={showPassword} onChange={setShowPassword} />
