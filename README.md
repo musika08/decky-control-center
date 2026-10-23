@@ -1,4 +1,6 @@
-# Windows Quick Settings
+# Control Center
+
+Formerly "Windows Quick Settings". The plugin folder (`windows-quick-settings`) and internal ids are unchanged.
 
 A Decky Loader plugin for Windows that puts common system controls in the Quick Access menu:
 

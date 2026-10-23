@@ -60,7 +60,7 @@ class Plugin:
         self._wifi_scan = wifi.ScanState()
 
     async def _main(self) -> None:
-        decky.logger.info("Windows Quick Settings started")
+        decky.logger.info("Control Center started")
 
     async def _unload(self) -> None:
         # Never leave a helper behind. Both at once: Decky stops the plugin host after 5 seconds.

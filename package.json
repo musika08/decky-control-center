@@ -1,7 +1,7 @@
 {
   "name": "windows-quick-settings",
   "version": "0.1.0",
-  "description": "Decky plugin: Windows brightness, volume, radios and ASUS battery charge limit in the Quick Access menu.",
+  "description": "Control Center, a Decky plugin: Windows brightness, volume, radios and ASUS battery charge limit in the Quick Access menu.",
   "type": "module",
   "private": true,
   "scripts": {

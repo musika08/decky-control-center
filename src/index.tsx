@@ -1007,8 +1007,8 @@ function Content() {
 }
 
 export default definePlugin(() => ({
-  name: 'Windows Quick Settings',
-  titleView: <div className={staticClasses.Title}>Windows Quick Settings</div>,
+  name: 'Control Center',
+  titleView: <div className={staticClasses.Title}>Control Center</div>,
   content: <Content />,
   icon: <FaSlidersH />,
 }));

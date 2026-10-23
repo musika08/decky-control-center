@@ -1,6 +1,6 @@
 """Wi-Fi and Bluetooth radios through WinRT Windows.Devices.Radios, via Windows PowerShell 5.1. No admin needed.
 
-This switches the radio itself (like the Quick Settings tiles); it does not touch airplane mode or adapters.
+This switches the radio itself (like the Windows Quick Settings tiles); it does not touch airplane mode or adapters.
 """
 import json
 from typing import Optional
