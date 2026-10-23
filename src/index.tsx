@@ -659,6 +659,12 @@ function WifiNetworksSection({ radio }: { radio: Radio }) {
   const [prompt, setPrompt] = useState<WifiNet | null>(null);
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const passwordBox = useRef<HTMLDivElement | null>(null);
+  // Steam's TextField ignores bIsPassword, so hide the text on the real <input> it renders.
+  useEffect(() => {
+    const input = passwordBox.current?.querySelector('input');
+    if (input) input.type = showPassword ? 'text' : 'password';
+  }, [showPassword, prompt]);
   const [connecting, setConnecting] = useState<string | null>(null);
   const [result, setResult] = useState<{ res: WifiResult; net: WifiNet | null } | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
@@ -803,8 +809,9 @@ function WifiNetworksSection({ radio }: { radio: Radio }) {
             <Field label={`Connect to ${prompt.ssid}`} description="Enter the network password." icon={<SignalIcon signal={prompt.signal} secured />} />
           </PanelSectionRow>
           <PanelSectionRow>
-            {/* Steam's TextField reads bIsPassword only when it mounts, so the key remounts it when "Show password" flips. */}
-            <TextField key={showPassword ? 'password-shown' : 'password-hidden'} label="Password" value={password} bIsPassword={!showPassword} onChange={(e) => setPassword(e.target.value)} />
+            <div ref={passwordBox}>
+              <TextField label="Password" value={password} bIsPassword={!showPassword} onChange={(e) => setPassword(e.target.value)} />
+            </div>
           </PanelSectionRow>
           <PanelSectionRow>
             <ToggleField label="Show password" checked={showPassword} onChange={setShowPassword} />
