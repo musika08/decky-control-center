@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "author": "Musika",
-  "license": "GPL-2.0-only",
+  "license": "GPL-3.0-only",
   "devDependencies": {
     "@rollup/plugin-commonjs": "^26.0.1",
     "@rollup/plugin-json": "^6.1.0",
