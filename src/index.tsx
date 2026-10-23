@@ -659,12 +659,6 @@ function WifiNetworksSection({ radio }: { radio: Radio }) {
   const [prompt, setPrompt] = useState<WifiNet | null>(null);
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const passwordBox = useRef<HTMLDivElement | null>(null);
-  // Steam's TextField ignores bIsPassword, so hide the text on the real <input> it renders.
-  useEffect(() => {
-    const input = passwordBox.current?.querySelector('input');
-    if (input) input.type = showPassword ? 'text' : 'password';
-  }, [showPassword, prompt]);
   const [connecting, setConnecting] = useState<string | null>(null);
   const [result, setResult] = useState<{ res: WifiResult; net: WifiNet | null } | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
@@ -809,7 +803,10 @@ function WifiNetworksSection({ radio }: { radio: Radio }) {
             <Field label={`Connect to ${prompt.ssid}`} description="Enter the network password." icon={<SignalIcon signal={prompt.signal} secured />} />
           </PanelSectionRow>
           <PanelSectionRow>
-            <div ref={passwordBox}>
+            {/* Steam's TextField ignores bIsPassword and its re-renders reset the input's type, so the dots come from a
+                CSS rule on this wrapper (React does not manage it). */}
+            <div className={showPassword ? undefined : 'wqs-password-hidden'}>
+              <style>{'.wqs-password-hidden input { -webkit-text-security: disc; }'}</style>
               <TextField label="Password" value={password} bIsPassword={!showPassword} onChange={(e) => setPassword(e.target.value)} />
             </div>
           </PanelSectionRow>
