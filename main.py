@@ -11,7 +11,7 @@ _PY_MODULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "py_modul
 if _PY_MODULES not in sys.path:
     sys.path.append(_PY_MODULES)
 
-from wqs import asus_acpi, bluetooth, brightness, radios, volume  # noqa: E402
+from wqs import asus_acpi, bluetooth, brightness, radios, volume, wifi  # noqa: E402
 
 ON_WINDOWS = sys.platform == "win32"
 T = TypeVar("T")
@@ -55,6 +55,9 @@ class Plugin:
         # Lock order: _pair_lock before _scan_lock, never the other way round.
         self._scan_lock = asyncio.Lock()
         self._pair_lock = asyncio.Lock()
+        # Wi-Fi: one connect / disconnect / forget at a time; the search is only re-reading Windows' list.
+        self._wifi_lock = asyncio.Lock()
+        self._wifi_scan = wifi.ScanState()
 
     async def _main(self) -> None:
         decky.logger.info("Windows Quick Settings started")
@@ -230,6 +233,55 @@ class Plugin:
                 return state
             self._pairing = None
             return self._idle_pairing()
+
+    # Wi-Fi networks
+    @staticmethod
+    def _wifi_failed() -> dict:
+        return {"ok": False, "present": False, "interface": None, "state": None, "connected": None, "profiles": [],
+                "location_off": False}
+
+    async def get_wifi(self) -> dict:
+        return await self._guarded("get_wifi", wifi.get_status, self._wifi_failed())
+
+    @staticmethod
+    def _wifi_scan_failed() -> dict:
+        return {"active": False, "location_off": False, "error": "The request failed.", "networks": []}
+
+    async def start_wifi_scan(self) -> dict:
+        """Opens the search; the panel then polls get_wifi_scan every few seconds until stop_wifi_scan."""
+        self._wifi_scan.start()
+        return await self.get_wifi_scan()
+
+    async def get_wifi_scan(self) -> dict:
+        return await self._guarded("get_wifi_scan", self._wifi_scan.refresh, self._wifi_scan_failed())
+
+    async def stop_wifi_scan(self) -> dict:
+        self._wifi_scan.stop()
+        return self._wifi_scan.snapshot()
+
+    async def connect_wifi(self, ssid: str, password: str = "") -> dict:
+        """Only called from the panel's Connect. The password is never logged or returned."""
+        async with self._wifi_lock:
+            res = await self._guarded("connect_wifi", lambda: wifi.connect(ssid, password),
+                                      {"ok": False, "status": "failed", "message": "Could not connect: the request "
+                                       "failed.", "ssid": ssid})
+        decky.logger.info(f"Wi-Fi connect {ssid!r}: {res.get('status')}")
+        return res
+
+    async def disconnect_wifi(self) -> dict:
+        async with self._wifi_lock:
+            res = await self._guarded("disconnect_wifi", wifi.disconnect,
+                                      {"ok": False, "message": "The request failed."})
+        decky.logger.info(f"Wi-Fi disconnect: {res.get('ok')}")
+        return res
+
+    async def forget_wifi(self, profile: str) -> dict:
+        """Only called from the Forget confirmation in the panel."""
+        async with self._wifi_lock:
+            res = await self._guarded("forget_wifi", lambda: wifi.forget(profile),
+                                      {"ok": False, "message": "The request failed."})
+        decky.logger.info(f"Wi-Fi forget {profile!r}: {res.get('ok')}")
+        return res
 
     # ASUS battery charge limit
     async def get_battery(self) -> dict:

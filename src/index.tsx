@@ -1,7 +1,7 @@
 import { callable, definePlugin } from '@decky/api';
-import { ButtonItem, Field, PanelSection, PanelSectionRow, SliderField, Spinner, ToggleField, staticClasses } from '@decky/ui';
+import { ButtonItem, Field, PanelSection, PanelSectionRow, SliderField, Spinner, TextField, ToggleField, staticClasses } from '@decky/ui';
 import { useEffect, useRef, useState } from 'react';
-import { FaBluetoothB, FaGamepad, FaHeadphones, FaLaptop, FaMobileAlt, FaSlidersH } from 'react-icons/fa';
+import { FaBluetoothB, FaGamepad, FaHeadphones, FaLaptop, FaLock, FaMobileAlt, FaSlidersH } from 'react-icons/fa';
 
 type Brightness = { supported: boolean; value: number | null };
 type Volume = { supported: boolean; level: number; muted: boolean };
@@ -40,6 +40,28 @@ const getPairing = callable<[], Pairing>('get_pairing');
 const respondPairing = callable<[accept: boolean], Pairing>('respond_pairing');
 const cancelPairing = callable<[], Pairing>('cancel_pairing');
 const dismissPairing = callable<[], Pairing>('dismiss_pairing');
+type WifiNet = { ssid: string; signal: number; auth: string; kind: string; secured: boolean; supported: boolean };
+type WifiProfile = { name: string; readonly: boolean };
+type WifiState = {
+  ok: boolean;
+  present: boolean;
+  interface: string | null;
+  state: string | null;
+  connected: { ssid: string; signal: number; profile: string | null; auth: string | null } | null;
+  profiles: WifiProfile[];
+  location_off: boolean;
+};
+type WifiScan = { active: boolean; location_off: boolean; error: string | null; networks: WifiNet[] };
+type WifiResult = { ok: boolean; status: string; message: string; ssid: string };
+type WifiDone = { ok: boolean; message: string };
+
+const getWifi = callable<[], WifiState>('get_wifi');
+const startWifiScan = callable<[], WifiScan>('start_wifi_scan');
+const getWifiScan = callable<[], WifiScan>('get_wifi_scan');
+const stopWifiScan = callable<[], WifiScan>('stop_wifi_scan');
+const connectWifi = callable<[ssid: string, password: string], WifiResult>('connect_wifi');
+const disconnectWifi = callable<[], WifiDone>('disconnect_wifi');
+const forgetWifi = callable<[profile: string], WifiDone>('forget_wifi');
 const getBattery = callable<[], Battery>('get_battery');
 const setBatteryLimit = callable<[limit: number], SetResult>('set_battery_limit');
 
@@ -525,6 +547,398 @@ function BluetoothDevicesSection({ radio }: { radio: Radio }) {
   );
 }
 
+// Signal bars (0-100%), with a lock when the network is secured.
+function SignalIcon({ signal, secured }: { signal: number; secured?: boolean }) {
+  const bars = signal >= 75 ? 4 : signal >= 50 ? 3 : signal >= 25 ? 2 : 1;
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'flex-end', gap: '3px' }}>
+      <svg width="18" height="16" viewBox="0 0 18 16" aria-label={`Signal ${signal}%`}>
+        {[0, 1, 2, 3].map((i) => (
+          <rect key={i} x={i * 5} y={12 - i * 4} width="3" height={4 + i * 4} rx="1" fill="currentColor" opacity={i < bars ? 1 : 0.3} />
+        ))}
+      </svg>
+      {secured && <FaLock size={10} />}
+    </span>
+  );
+}
+
+function networkText(n: WifiNet, saved: boolean) {
+  if (!n.supported) return n.kind === 'enterprise' ? 'Enterprise sign-in. Connect from Windows Settings' : 'Connect from Windows Settings';
+  if (saved) return `Saved, signal ${n.signal}%`;
+  return `${n.secured ? 'Secured' : 'Open'}, signal ${n.signal}%`;
+}
+
+function SavedNetwork({ profile, busy, onConnect, onForgotten }: { profile: WifiProfile; busy: boolean; onConnect: () => void; onForgotten: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (confirming) {
+    return (
+      <>
+        <PanelSectionRow>
+          <Field label={`Forget ${profile.name}?`} description="To use it again, you will need the password." />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={working}
+            onClick={async () => {
+              setWorking(true);
+              setError(null);
+              try {
+                const res = await forgetWifi(profile.name);
+                if (!res.ok) setError(res.message);
+              } catch {
+                setError('The request failed.');
+              } finally {
+                setWorking(false);
+                setConfirming(false);
+                setOpen(false);
+                onForgotten();
+              }
+            }}
+          >
+            {working ? 'Forgetting...' : 'Forget'}
+          </ButtonItem>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={working} onClick={() => setConfirming(false)}>
+            Keep
+          </ButtonItem>
+        </PanelSectionRow>
+      </>
+    );
+  }
+  if (open) {
+    return (
+      <>
+        <PanelSectionRow>
+          <Field label={profile.name} description={error ?? (profile.readonly ? 'Saved by your organization' : 'Saved network')} />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={busy}
+            onClick={() => {
+              setOpen(false);
+              onConnect();
+            }}
+          >
+            Connect
+          </ButtonItem>
+        </PanelSectionRow>
+        {!profile.readonly && (
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={busy} onClick={() => setConfirming(true)}>
+              Forget
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => setOpen(false)}>
+            Back
+          </ButtonItem>
+        </PanelSectionRow>
+      </>
+    );
+  }
+  return (
+    <PanelSectionRow>
+      <ButtonItem label={profile.name} description={error ?? 'Saved'} onClick={() => setOpen(true)}>
+        Options
+      </ButtonItem>
+    </PanelSectionRow>
+  );
+}
+
+function WifiNetworksSection({ radio }: { radio: Radio }) {
+  const [status, setStatus] = useState<WifiState | null>(null);
+  const [found, setFound] = useState<WifiScan | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [prompt, setPrompt] = useState<WifiNet | null>(null);
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [connecting, setConnecting] = useState<string | null>(null);
+  const [result, setResult] = useState<{ res: WifiResult; net: WifiNet | null } | null>(null);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const searchingRef = useRef(false);
+  searchingRef.current = searching;
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      // Closing the panel ends the search.
+      if (searchingRef.current) stopWifiScan().catch(() => undefined);
+    },
+    [],
+  );
+  const refresh = () => {
+    getWifi()
+      .then((s) => {
+        if (mounted.current) setStatus(s);
+      })
+      .catch(() => undefined);
+  };
+  useEffect(() => {
+    if (radio.on) refresh();
+  }, [radio.on]);
+
+  // While the search is open, read Windows' network list again every few seconds.
+  useEffect(() => {
+    if (!searching) return;
+    const timer = window.setInterval(() => {
+      getWifiScan()
+        .then((s) => {
+          if (!mounted.current) return;
+          setFound(s);
+          if (!s.active) setSearching(false);
+        })
+        .catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [searching]);
+
+  if (!radio.present) return null;
+  if (!radio.on) {
+    return (
+      <PanelSection title="Wi-Fi networks">
+        <PanelSectionRow>
+          <Field label="Wi-Fi is off" />
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  const search = async () => {
+    setFound(null);
+    setSearching(true);
+    try {
+      const s = await startWifiScan();
+      if (!mounted.current) return;
+      setFound(s);
+      if (!s.active) setSearching(false);
+    } catch {
+      if (mounted.current) setSearching(false);
+    }
+  };
+
+  const stopSearch = () => {
+    setSearching(false);
+    stopWifiScan().catch(() => undefined);
+  };
+
+  const connect = async (ssid: string, net: WifiNet | null, pw: string) => {
+    setPrompt(null);
+    setPassword('');
+    setShowPassword(false);
+    setConnecting(ssid);
+    setResult(null);
+    if (searching) stopSearch();
+    let res: WifiResult;
+    try {
+      res = await connectWifi(ssid, pw);
+    } catch {
+      res = { ok: false, status: 'failed', message: 'The request failed.', ssid };
+    }
+    if (!mounted.current) return;
+    setConnecting(null);
+    if (res.status === 'needs_password' && net) {
+      setPrompt(net);
+    } else {
+      setResult({ res, net });
+    }
+    refresh();
+  };
+
+  const savedNames = new Set((status?.profiles ?? []).map((p) => p.name));
+  const current = status?.connected ?? null;
+
+  const body = () => {
+    if (connecting !== null) {
+      return (
+        <PanelSectionRow>
+          <Field label={`Connecting to ${connecting}...`} description="This can take up to 15 seconds.">
+            <Spinner style={SPINNER_STYLE} />
+          </Field>
+        </PanelSectionRow>
+      );
+    }
+    if (result) {
+      const { res, net } = result;
+      const label = res.ok ? (res.status === 'requested' ? `Connecting to ${res.ssid}` : `Connected to ${res.ssid}`) : `Could not connect to ${res.ssid}`;
+      const retry = net && net.secured && (res.status === 'wrong_password' || res.status === 'invalid_password');
+      return (
+        <>
+          <PanelSectionRow>
+            <Field label={label} description={res.message} />
+          </PanelSectionRow>
+          {retry && (
+            <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                onClick={() => {
+                  setResult(null);
+                  setPrompt(net);
+                }}
+              >
+                Try again
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={() => setResult(null)}>
+              OK
+            </ButtonItem>
+          </PanelSectionRow>
+        </>
+      );
+    }
+    if (prompt) {
+      const tooShort = password.length < 8;
+      return (
+        <>
+          <PanelSectionRow>
+            <Field label={`Connect to ${prompt.ssid}`} description="Enter the network password." icon={<SignalIcon signal={prompt.signal} secured />} />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <TextField label="Password" value={password} bIsPassword={!showPassword} onChange={(e) => setPassword(e.target.value)} />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField label="Show password" checked={showPassword} onChange={setShowPassword} />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={tooShort} onClick={() => connect(prompt.ssid, prompt, password)}>
+              Connect
+            </ButtonItem>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              onClick={() => {
+                setPrompt(null);
+                setPassword('');
+                setShowPassword(false);
+              }}
+            >
+              Cancel
+            </ButtonItem>
+          </PanelSectionRow>
+        </>
+      );
+    }
+    const networks = (found?.networks ?? []).filter((n) => !(current && n.ssid === current.ssid));
+    return (
+      <>
+        {status && !status.present && (
+          <PanelSectionRow>
+            <Field label="No Wi-Fi adapter found" />
+          </PanelSectionRow>
+        )}
+        {current && (
+          <>
+            <PanelSectionRow>
+              <Field label={current.ssid} description={note ?? `Connected, signal ${current.signal}%`} icon={<SignalIcon signal={current.signal} />} />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                disabled={disconnecting}
+                onClick={async () => {
+                  setDisconnecting(true);
+                  setNote(null);
+                  try {
+                    const res = await disconnectWifi();
+                    if (!res.ok && mounted.current) setNote(res.message);
+                  } catch {
+                    if (mounted.current) setNote('The request failed.');
+                  } finally {
+                    if (mounted.current) setDisconnecting(false);
+                    refresh();
+                  }
+                }}
+              >
+                {disconnecting ? 'Disconnecting...' : 'Disconnect'}
+              </ButtonItem>
+            </PanelSectionRow>
+          </>
+        )}
+        {status?.location_off && !current && !found?.location_off && (
+          <PanelSectionRow>
+            <Field label="Turn on Location in Windows Settings to search for networks" description="Saved networks still work." />
+          </PanelSectionRow>
+        )}
+        {(status?.profiles ?? [])
+          .filter((p) => !(current && (p.name === current.profile || p.name === current.ssid)))
+          .map((p) => (
+            <SavedNetwork key={p.name} profile={p} busy={connecting !== null} onConnect={() => connect(p.name, null, '')} onForgotten={refresh} />
+          ))}
+        {searching ? (
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={stopSearch}>
+              Stop search
+            </ButtonItem>
+          </PanelSectionRow>
+        ) : (
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={search}>
+              Search for networks
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
+        {found?.location_off && (
+          <PanelSectionRow>
+            <Field label="Turn on Location in Windows Settings to search for networks" description="Saved networks still work." />
+          </PanelSectionRow>
+        )}
+        {found?.error && (
+          <PanelSectionRow>
+            <Field label="Could not read the networks" description={found.error} />
+          </PanelSectionRow>
+        )}
+        {searching && !found && (
+          <PanelSectionRow>
+            <Field label="Searching...">
+              <Spinner style={SPINNER_STYLE} />
+            </Field>
+          </PanelSectionRow>
+        )}
+        {found && !found.location_off && !found.error && networks.length === 0 && (
+          <PanelSectionRow>
+            <Field label="No networks found" description={searching ? 'Windows looks for networks every few seconds.' : undefined} />
+          </PanelSectionRow>
+        )}
+        {networks.map((n) => {
+          const saved = savedNames.has(n.ssid);
+          return (
+            <PanelSectionRow key={n.ssid}>
+              <ButtonItem
+                label={n.ssid}
+                description={networkText(n, saved)}
+                icon={<SignalIcon signal={n.signal} secured={n.secured} />}
+                disabled={!n.supported && !saved}
+                onClick={() => {
+                  if (saved || !n.secured) connect(n.ssid, n, '');
+                  else {
+                    setPassword('');
+                    setShowPassword(false);
+                    setPrompt(n);
+                  }
+                }}
+              >
+                Connect
+              </ButtonItem>
+            </PanelSectionRow>
+          );
+        })}
+      </>
+    );
+  };
+
+  return <PanelSection title="Wi-Fi networks">{body()}</PanelSection>;
+}
+
 function BatterySection() {
   const [state, setState] = useState<Battery | null>(null);
   const [busy, setBusy] = useState(false);
@@ -580,6 +994,7 @@ function Content() {
       <BrightnessSection />
       <VolumeSection />
       <RadiosSection state={radios} refresh={refreshRadios} />
+      {radios && <WifiNetworksSection radio={radios.wifi} />}
       {radios && <BluetoothDevicesSection radio={radios.bluetooth} />}
       <BatterySection />
     </>
