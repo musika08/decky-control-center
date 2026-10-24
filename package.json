@@ -1,5 +1,5 @@
 {
-  "name": "windows-quick-settings",
+  "name": "control-center",
   "version": "0.1.0",
   "description": "Control Center, a Decky plugin: Windows brightness, volume, radios and ASUS battery charge limit in the Quick Access menu.",
   "type": "module",

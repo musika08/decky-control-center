@@ -1,6 +1,6 @@
 # Control Center
 
-Formerly "Windows Quick Settings". The plugin folder (`windows-quick-settings`) and internal ids are unchanged.
+Formerly "Windows Quick Settings". The plugin folder is `control-center` (it was `windows-quick-settings`; the Decky Plugin for Windows dashboard moves an old install and its settings over).
 
 A Decky Loader plugin for Windows that puts common system controls in the Quick Access menu:
 
