@@ -1,6 +1,7 @@
 import { callable, definePlugin } from '@decky/api';
-import { ButtonItem, Field, PanelSection, PanelSectionRow, SliderField, Spinner, TextField, ToggleField, staticClasses } from '@decky/ui';
+import { ButtonItem, Field, Navigation, PanelSection, PanelSectionRow, SliderField, Spinner, TextField, ToggleField, staticClasses } from '@decky/ui';
 import { useEffect, useRef, useState } from 'react';
+import { SUPPORT_LABEL, SUPPORT_URL } from './view';
 import { FaBluetoothB, FaGamepad, FaHeadphones, FaLaptop, FaLock, FaMobileAlt, FaSlidersH } from 'react-icons/fa';
 
 type Brightness = { supported: boolean; value: number | null };
@@ -1002,6 +1003,13 @@ function Content() {
       {radios && <WifiNetworksSection radio={radios.wifi} />}
       {radios && <BluetoothDevicesSection radio={radios.bluetooth} />}
       <BatterySection />
+      <PanelSection>
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={() => Navigation.NavigateToExternalWeb(SUPPORT_URL)}>
+            {SUPPORT_LABEL}
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
     </>
   );
 }
